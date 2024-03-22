@@ -39,6 +39,9 @@ pub struct ResidualTransform<T: ArrowFloatType> {
 
     /// Vector Column
     vec_col: String,
+
+    /// Remain the source vector column or not.
+    remain_vector: bool,
 }
 
 impl<T: ArrowFloatType> std::fmt::Debug for ResidualTransform<T> {
@@ -48,11 +51,17 @@ impl<T: ArrowFloatType> std::fmt::Debug for ResidualTransform<T> {
 }
 
 impl<T: ArrowFloatType> ResidualTransform<T> {
-    pub fn new(centroids: MatrixView<T>, part_col: &str, column: &str) -> Self {
+    pub fn new(
+        centroids: MatrixView<T>,
+        part_col: &str,
+        column: &str,
+        remain_vector: bool,
+    ) -> Self {
         Self {
             centroids,
             part_col: part_col.to_owned(),
             vec_col: column.to_owned(),
+            remain_vector,
         }
     }
 }
@@ -120,11 +129,13 @@ impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
         let residual_arr =
             FixedSizeListArray::try_new_from_values(T::ArrayType::from(residual_arr), dim)?;
 
-        // Replace original column with residual column.
-        let batch = batch.drop_column(&self.vec_col)?;
+        let batch = if self.remain_vector {
+            batch.clone()
+        } else {
+            batch.drop_column(&self.vec_col)?
+        };
 
         let residual_field = Field::new(RESIDUAL_COLUMN, residual_arr.data_type().clone(), false);
-
         let batch = batch.try_with_column(residual_field, Arc::new(residual_arr))?;
         Ok(batch)
     }

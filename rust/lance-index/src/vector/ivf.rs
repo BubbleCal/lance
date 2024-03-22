@@ -107,6 +107,18 @@ pub fn new_ivf(
     }
 }
 
+pub struct TransformeOptions {
+    pub remain_original_vector: bool,
+}
+
+impl Default for TransformeOptions {
+    fn default() -> Self {
+        Self {
+            remain_original_vector: false,
+        }
+    }
+}
+
 fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveType>(
     centroids: &T::ArrayType,
     dimension: usize,
@@ -114,6 +126,7 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveTy
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
+    options: TransformeOptions,
 ) -> Arc<dyn Ivf> {
     let mat = MatrixView::<T>::new(Arc::new(centroids.clone()), dimension);
     Arc::new(IvfImpl::<T>::new_with_pq(
@@ -122,6 +135,7 @@ fn new_ivf_with_pq_impl<T: ArrowFloatType + Dot + Cosine + L2 + ArrowPrimitiveTy
         vector_column,
         pq,
         range,
+        options,
     ))
 }
 
@@ -132,7 +146,9 @@ pub fn new_ivf_with_pq(
     vector_column: &str,
     pq: Arc<dyn ProductQuantizer>,
     range: Option<Range<u32>>,
+    options: Option<TransformeOptions>,
 ) -> Result<Arc<dyn Ivf>> {
+    let options = options.unwrap_or_default();
     match centroids.data_type() {
         DataType::Float16 => Ok(new_ivf_with_pq_impl::<Float16Type>(
             centroids.as_primitive(),
@@ -141,6 +157,7 @@ pub fn new_ivf_with_pq(
             vector_column,
             pq,
             range,
+            options,
         )),
         DataType::Float32 => Ok(new_ivf_with_pq_impl::<Float32Type>(
             centroids.as_primitive(),
@@ -149,6 +166,7 @@ pub fn new_ivf_with_pq(
             vector_column,
             pq,
             range,
+            options,
         )),
         DataType::Float64 => Ok(new_ivf_with_pq_impl::<Float64Type>(
             centroids.as_primitive(),
@@ -157,6 +175,7 @@ pub fn new_ivf_with_pq(
             vector_column,
             pq,
             range,
+            options,
         )),
         _ => Err(Error::Index {
             message: format!(
@@ -251,6 +270,7 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
         vector_column: &str,
         pq: Arc<dyn ProductQuantizer>,
         range: Option<Range<u32>>,
+        options: TransformeOptions,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
@@ -278,17 +298,20 @@ impl<T: ArrowFloatType + Dot + L2 + ArrowPrimitiveType> IvfImpl<T> {
                 centroids.clone(),
                 PART_ID_COLUMN,
                 vector_column,
+                options.remain_original_vector,
             )));
             transforms.push(Arc::new(PQTransformer::new(
                 pq.clone(),
                 RESIDUAL_COLUMN,
                 PQ_CODE_COLUMN,
+                false,
             )));
         } else {
             transforms.push(Arc::new(PQTransformer::new(
                 pq.clone(),
                 vector_column,
                 PQ_CODE_COLUMN,
+                options.remain_original_vector,
             )));
         };
         Self {

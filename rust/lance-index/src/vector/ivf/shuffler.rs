@@ -23,6 +23,7 @@
 //! 2. shuffling into memory is fast but we should add disk buffer to support bigger datasets
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -30,7 +31,7 @@ use arrow_array::{
     UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Field, Schema as ArrowSchema};
-use futures::stream::repeat_with;
+use futures::stream::{repeat_with, Peekable};
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
@@ -91,40 +92,16 @@ pub async fn shuffle_dataset(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
-    // TODO: dynamically detect schema from the transforms.
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        ROW_ID_FIELD.clone(),
-        Field::new(PART_ID_COLUMN, DataType::UInt32, true),
-        Field::new(
-            PQ_CODE_COLUMN,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, true)),
-                num_sub_vectors as i32,
-            ),
-            false,
-        ),
-    ]));
-
     // step 1: either use precomputed shuffle files or write shuffle data to a file
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
-        let mut shuffler = IvfShuffler::try_new(
-            num_partitions,
-            num_sub_vectors,
-            Some(path),
-            Schema::try_from(schema.as_ref())?,
-        )?;
+        let mut shuffler = IvfShuffler::try_new(num_partitions, num_sub_vectors, Some(path))?;
         unsafe {
             shuffler.set_unsorted_buffers(&buffers);
         }
 
         shuffler
     } else {
-        let mut shuffler = IvfShuffler::try_new(
-            num_partitions,
-            num_sub_vectors,
-            None,
-            Schema::try_from(schema.as_ref())?,
-        )?;
+        let mut shuffler = IvfShuffler::try_new(num_partitions, num_sub_vectors, None)?;
 
         let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
@@ -198,7 +175,18 @@ pub async fn shuffle_dataset(
             })
             .boxed();
 
-        let stream = lance_io::stream::RecordBatchStreamAdapter::new(schema.clone(), stream);
+        let mut stream = Box::pin(stream.peekable());
+
+        let schema = match stream.as_mut().peek().await {
+            Some(Ok(batch)) => batch.schema(),
+            _ => {
+                return Err(Error::IO {
+                    message: "no input data to shuffle".to_owned(),
+                    location: location!(),
+                })
+            }
+        };
+        let stream = lance_io::stream::RecordBatchStreamAdapter::new(schema, stream);
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;
@@ -233,8 +221,6 @@ pub struct IvfShuffler {
     pq_width: usize,
 
     output_dir: Path,
-
-    schema: Schema,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -248,12 +234,7 @@ struct ShuffleInput {
 }
 
 impl IvfShuffler {
-    pub fn try_new(
-        num_partitions: u32,
-        pq_width: usize,
-        output_dir: Option<Path>,
-        schema: Schema,
-    ) -> Result<Self> {
+    pub fn try_new(num_partitions: u32, pq_width: usize, output_dir: Option<Path>) -> Result<Self> {
         let output_dir = match output_dir {
             Some(output_dir) => output_dir,
             None => get_temp_dir()?,
@@ -263,7 +244,6 @@ impl IvfShuffler {
             num_partitions,
             pq_width,
             output_dir,
-            schema,
             unsorted_buffers: vec![],
         })
     }
@@ -287,7 +267,7 @@ impl IvfShuffler {
 
         let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
-            self.schema.clone(),
+            Schema::try_from(data.schema().as_ref())?,
             &Default::default(),
         )?;
 
@@ -489,32 +469,6 @@ impl IvfShuffler {
                 let (row_id_buffers, pq_code_buffers) =
                     self.shuffle_to_partitions(&input, size_counts).await?;
 
-                // finally, write the shuffled data to disk
-                let object_store = ObjectStore::local();
-                let output_file = format!("sorted_{}.lance", i);
-                let path = self.output_dir.child(output_file.clone());
-                let writer = object_store.create(&path).await?;
-
-                // TODO: dynamically detect schema from the transforms.
-                let schema = Arc::new(ArrowSchema::new(vec![
-                    ROW_ID_FIELD.clone(),
-                    ArrowField::new(PART_ID_COLUMN, DataType::UInt32, true),
-                    ArrowField::new(
-                        PQ_CODE_COLUMN,
-                        DataType::FixedSizeList(
-                            Arc::new(ArrowField::new("item", DataType::UInt8, true)),
-                            self.pq_width as i32,
-                        ),
-                        false,
-                    ),
-                ]));
-
-                let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
-                    writer,
-                    self.schema.clone(),
-                    &Default::default(),
-                )?;
-
                 let shuffled = row_id_buffers
                     .into_iter()
                     .zip(pq_code_buffers.into_iter())
@@ -538,6 +492,21 @@ impl IvfShuffler {
 
                         Ok(batch) as Result<_>
                     });
+
+                // finally, write the shuffled data to disk
+                let object_store = ObjectStore::local();
+                let output_file = format!("sorted_{}.lance", i);
+                let path = self.output_dir.child(output_file.clone());
+                let writer = object_store.create(&path).await?;
+
+                let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
+                    writer,
+                    self.schema.clone().ok_or(Error::IO {
+                        message: "schema is not set".to_owned(),
+                        location: location!(),
+                    })?,
+                    &Default::default(),
+                )?;
 
                 for batch in shuffled {
                     file_writer.write(&[batch?]).await?;
@@ -647,9 +616,13 @@ mod test {
 
         let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
 
-        let shuffler =
-            IvfShuffler::try_new(100, 32, None, Schema::try_from(schema.as_ref()).unwrap())
-                .unwrap();
+        let shuffler = IvfShuffler::try_new(
+            100,
+            32,
+            None,
+            Some(Schema::try_from(schema.as_ref()).unwrap()),
+        )
+        .unwrap();
 
         (stream, shuffler)
     }

@@ -54,8 +54,10 @@ async fn merge_streams(
     streams_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
     new_streams: &mut [Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>],
     part_id: u32,
+    column: &str,
     pq_array: &mut Vec<Arc<dyn Array>>,
     row_id_array: &mut Vec<Arc<dyn Array>>,
+    mut vector_array: Option<&mut Vec<Arc<dyn Array>>>,
 ) -> Result<()> {
     while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
         if stream_part_id != part_id {
@@ -80,6 +82,8 @@ async fn merge_streams(
             }
         };
 
+        println!("{:?}", batch.schema());
+
         let pq_codes = Arc::new(
             batch
                 .column_by_name(PQ_CODE_COLUMN)
@@ -96,6 +100,13 @@ async fn merge_streams(
         );
         pq_array.push(pq_codes);
         row_id_array.push(row_ids);
+        if let Some(vector_array) = vector_array.as_mut() {
+            let vector = batch
+                .column_by_name(column)
+                .expect("vector column not found")
+                .clone();
+            vector_array.push(vector);
+        }
 
         match stream.peek().await {
             Some(Ok(batch)) => {
@@ -207,8 +218,10 @@ pub(super) async fn write_pq_partitions(
             &mut streams_heap,
             &mut new_streams,
             part_id,
+            "",
             &mut pq_array,
             &mut row_id_array,
+            None,
         )
         .await?;
 
@@ -299,13 +312,16 @@ pub(super) async fn write_hnsw_index_partitions(
         }
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
         let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+        let mut vector_array = vec![];
 
         merge_streams(
             &mut streams_heap,
             &mut new_streams,
             part_id,
+            column,
             &mut pq_array,
             &mut row_id_array,
+            Some(&mut vector_array),
         )
         .await?;
 

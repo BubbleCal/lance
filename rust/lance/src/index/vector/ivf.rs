@@ -263,6 +263,7 @@ pub(crate) async fn optimize_vector_indices(
         vector_column,
         pq_index.pq.clone(),
         None,
+        None,
     )?;
 
     // Shuffled un-indexed data with partition.
@@ -2111,9 +2112,9 @@ mod tests {
 
         let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
 
-        let centroids = generate_random_array(2 * DIM);
+        let centroids = generate_random_array(8 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(8, Arc::new(ivf_centroids)).unwrap();
 
         let codebook = Arc::new(generate_random_array(256 * DIM));
         let pq_params = PQBuildParams::with_codebook(4, 8, codebook);

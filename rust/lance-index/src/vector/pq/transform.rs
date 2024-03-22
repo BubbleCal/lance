@@ -32,6 +32,7 @@ pub struct PQTransformer {
     quantizer: Arc<dyn ProductQuantizer>,
     input_column: String,
     output_column: String,
+    remain_input: bool,
 }
 
 impl PQTransformer {
@@ -39,11 +40,13 @@ impl PQTransformer {
         quantizer: Arc<dyn ProductQuantizer>,
         input_column: &str,
         output_column: &str,
+        remain_input: bool,
     ) -> Self {
         Self {
             quantizer,
             input_column: input_column.to_owned(),
             output_column: output_column.to_owned(),
+            remain_input,
         }
     }
 }
@@ -78,10 +81,17 @@ impl Transformer for PQTransformer {
             ),
             location: location!(),
         })?;
+
+        let batch = if self.remain_input {
+            batch.clone()
+        } else {
+            batch.drop_column(&self.input_column)?
+        };
+
         let pq_code = self.quantizer.transform(&data).await?;
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
-        let batch = batch.drop_column(&self.input_column)?;
+
         Ok(batch)
     }
 }
@@ -119,7 +129,7 @@ mod tests {
         )
         .unwrap();
 
-        let transformer = PQTransformer::new(pq, "vec", "pq_code");
+        let transformer = PQTransformer::new(pq, "vec", "pq_code", false);
         let batch = transformer.transform(&batch).await.unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());

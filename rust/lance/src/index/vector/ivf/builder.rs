@@ -25,7 +25,7 @@ use tracing::instrument;
 use lance_core::{Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
-    ivf::{shuffler::shuffle_dataset, storage::IvfData},
+    ivf::{shuffler::shuffle_dataset, storage::IvfData, TransformeOptions},
     pq::ProductQuantizer,
 };
 use lance_io::{stream::RecordBatchStream, traits::Writer};
@@ -77,6 +77,7 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
+        None,
     )?;
 
     let stream = shuffle_dataset(
@@ -132,6 +133,9 @@ pub(super) async fn build_hnsw_partitions(
         });
     }
 
+    let options = TransformeOptions {
+        remain_original_vector: true,
+    };
     let ivf_model = lance_index::vector::ivf::new_ivf_with_pq(
         ivf.centroids.values(),
         ivf.centroids.value_length() as usize,
@@ -139,6 +143,7 @@ pub(super) async fn build_hnsw_partitions(
         column,
         pq.clone(),
         Some(part_range),
+        Some(options),
     )?;
 
     let stream = shuffle_dataset(
