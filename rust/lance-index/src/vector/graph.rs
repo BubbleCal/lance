@@ -257,11 +257,9 @@ pub(super) fn beam_search(
 pub(super) fn greedy_search(
     graph: &dyn Graph,
     start: u32,
-    query: &[f32],
-    dist_calc: Option<Arc<dyn DistCalculator>>,
+    dist_calc: Arc<dyn DistCalculator>,
 ) -> Result<(OrderedFloat, u32)> {
     let mut current = start;
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
     let mut closest_dist = dist_calc.distance(&[start])[0];
     loop {
         let neighbors: Vec<_> = graph

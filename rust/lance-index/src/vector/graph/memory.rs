@@ -62,6 +62,10 @@ impl VectorStorage for InMemoryVectorStorage {
             metric_type: self.metric_type,
         })
     }
+
+    fn dist_calculator_from(&self, id: u32) -> Box<dyn DistCalculator> {
+        self.dist_calculator(self.vector(id))
+    }
 }
 
 struct InMemoryDistanceCal {

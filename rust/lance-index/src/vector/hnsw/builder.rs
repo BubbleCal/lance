@@ -118,7 +118,7 @@ pub struct HNSWBuilder {
     params: HnswBuildParams,
 
     /// Vector storage for the graph.
-    vectors: Arc<InMemoryVectorStorage>,
+    vectors: Arc<dyn VectorStorage>,
 
     levels: Vec<GraphBuilder>,
 
@@ -127,7 +127,7 @@ pub struct HNSWBuilder {
 
 impl HNSWBuilder {
     /// Create a new [`HNSWBuilder`] with in memory vector storage.
-    pub fn new(vectors: Arc<InMemoryVectorStorage>) -> Self {
+    pub fn new(vectors: Arc<dyn VectorStorage>) -> Self {
         Self {
             params: HnswBuildParams::default(),
             vectors,
@@ -137,7 +137,7 @@ impl HNSWBuilder {
     }
 
     /// Create a new [`HNSWBuilder`] with prepared params and in memory vector storage.
-    pub fn with_params(params: HnswBuildParams, vectors: Arc<InMemoryVectorStorage>) -> Self {
+    pub fn with_params(params: HnswBuildParams, vectors: Arc<dyn VectorStorage>) -> Self {
         Self {
             params,
             vectors,
@@ -184,7 +184,7 @@ impl HNSWBuilder {
         //  }
         // ```
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
-            ep = greedy_search(cur_level, ep, query, None)?.1;
+            ep = greedy_search(cur_level, ep, None)?.1;
         }
 
         let mut ep = vec![ep];

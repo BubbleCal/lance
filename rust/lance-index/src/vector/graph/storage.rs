@@ -36,4 +36,6 @@ pub trait VectorStorage: Send + Sync {
     /// Using dist calcualtor can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: &[f32]) -> Box<dyn DistCalculator>;
+
+    fn dist_calculator_from(&self, id: u32) -> Box<dyn DistCalculator>;
 }
