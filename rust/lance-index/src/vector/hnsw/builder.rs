@@ -165,7 +165,7 @@ impl HNSWBuilder {
 
     /// Insert one node.
     fn insert(&mut self, node: u32) -> Result<()> {
-        let query = self.vectors.vector(node);
+        let dist_calc: Arc<_> = self.vectors.dist_calculator_from(node).into();
         let level = self.random_level();
 
         let levels_to_search = if self.levels.len() > level as usize {
@@ -184,7 +184,7 @@ impl HNSWBuilder {
         //  }
         // ```
         for cur_level in self.levels.iter().rev().take(levels_to_search) {
-            ep = greedy_search(cur_level, ep, None)?.1;
+            ep = greedy_search(cur_level, ep, dist_calc.clone())?.1;
         }
 
         let mut ep = vec![ep];
@@ -193,15 +193,14 @@ impl HNSWBuilder {
             let candidates = beam_search(
                 cur_level,
                 &ep,
-                query,
                 self.params.ef_construction,
-                None,
+                dist_calc.clone(),
                 None,
             )?;
             let neighbors: Vec<_> = if self.params.use_select_heuristic {
                 select_neighbors_heuristic(
                     cur_level,
-                    query,
+                    node,
                     &candidates,
                     self.params.m,
                     self.params.extend_candidates,

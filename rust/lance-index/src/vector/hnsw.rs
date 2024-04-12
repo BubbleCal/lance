@@ -478,7 +478,7 @@ fn select_neighbors(
 /// NOTE: the result is not ordered
 pub(crate) fn select_neighbors_heuristic(
     graph: &GraphBuilder,
-    query: &[f32],
+    node: u32,
     orderd_candidates: &BinaryHeap<OrderedNode>,
     k: usize,
     extend_candidates: bool,
@@ -490,7 +490,7 @@ pub(crate) fn select_neighbors_heuristic(
         .collect::<BinaryHeap<_>>();
 
     if extend_candidates {
-        let dist_calc = graph.storage().dist_calculator(query);
+        let dist_calc = graph.storage().dist_calculator_from(node);
         let mut visited = HashSet::with_capacity(orderd_candidates.len() * k);
         visited.extend(orderd_candidates.iter().map(|node| node.id));
         orderd_candidates.iter().sorted().rev().for_each(|node| {

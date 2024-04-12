@@ -172,13 +172,12 @@ pub trait Graph {
 pub(super) fn beam_search(
     graph: &dyn Graph,
     start: &[u32],
-    query: &[f32],
     k: usize,
-    dist_calc: Option<Arc<dyn DistCalculator>>,
+    dist_calc: Arc<dyn DistCalculator>,
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
 ) -> Result<BinaryHeap<OrderedNode>> {
     let mut visited: HashSet<_> = start.iter().copied().collect();
-    let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
+    // let dist_calc = dist_calc.unwrap_or_else(|| graph.storage().dist_calculator(query).into());
     let mut candidates: BinaryHeap<Reverse<OrderedNode>> = dist_calc
         .distance(start)
         .iter()
