@@ -67,6 +67,10 @@ impl IvfData {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.lengths.iter().sum::<u32>() as usize
+    }
+
     pub async fn load(reader: &FileReader) -> Result<Self> {
         let schema = reader.schema();
         let meta_str = schema.metadata.get(IVF_METADATA_KEY).ok_or(Error::Index {

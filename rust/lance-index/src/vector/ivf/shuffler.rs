@@ -142,7 +142,6 @@ pub async fn shuffle_dataset(
 
                     // Filter out NaNs/Infs
                     batch = nan_filter.transform(&batch)?;
-
                     ivf.transform(&batch)
                 })
             })
@@ -253,9 +252,9 @@ impl IvfShuffler {
         )?;
 
         while let Some(batch) = data.next().await {
-            file_writer.write(&[batch?]).await?;
+            let batch = batch?;
+            file_writer.write(&[batch]).await?;
         }
-
         file_writer.finish().await?;
 
         unsafe {

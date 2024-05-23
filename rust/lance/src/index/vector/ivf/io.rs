@@ -384,6 +384,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
     let mut aux_ivf = IvfData::empty();
     let mut hnsw_metadata = Vec::with_capacity(ivf.num_partitions());
+    let mut read_cnt = 0;
     for (part_id, task) in tasks.into_iter().enumerate() {
         let offset = writer.len();
         let num_rows = task.await??;
@@ -423,6 +424,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         if let Some(aux_writer) = auxiliary_writer.as_mut() {
             let aux_part_reader =
                 FileReader::try_new_self_described(&object_store, aux_part_file, None).await?;
+            read_cnt += aux_part_reader.len();
 
             let batches = futures::stream::iter(0..aux_part_reader.num_batches())
                 .map(|batch_id| {
@@ -444,11 +446,17 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         }
     }
 
+    println!(
+        "Built {} HNSW partitions: read_cnt={}",
+        aux_ivf.len(),
+        read_cnt
+    );
+
     Ok((hnsw_metadata, aux_ivf))
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_hnsw_quantization_partition(
+pub(crate) async fn build_hnsw_quantization_partition(
     dataset: Arc<Dataset>,
     column: Arc<String>,
     metric_type: MetricType,
@@ -480,6 +488,8 @@ async fn build_hnsw_quantization_partition(
         metric_type = MetricType::L2;
     }
 
+    assert!(vectors.len() == row_ids.len());
+
     let build_hnsw = build_and_write_hnsw((*hnsw_params).clone(), vectors.clone(), writer);
 
     let build_store = match quantizer {
@@ -509,8 +519,10 @@ async fn build_and_write_hnsw(
     vectors: Arc<dyn Array>,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
+    let n = vectors.len();
     let hnsw = build_hnsw_model(hnsw_params, vectors).await?;
     let length = hnsw.write(&mut writer).await?;
+    assert!(n == hnsw.len());
     Result::Ok(length)
 }
 

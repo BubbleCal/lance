@@ -96,6 +96,7 @@ use crate::{
 };
 
 mod builder;
+mod builder_v2;
 mod io;
 
 /// IVF Index.
@@ -225,6 +226,13 @@ impl IVFIndex {
 
         let query = self.preprocess_query(partition_id, query)?;
         let batch = part_index.search(&query, pre_filter).await?;
+        if batch.num_rows() < part_index.row_ids().len() {
+            println!(
+                "batch size: {:?}, partition size: {}",
+                batch.num_rows(),
+                part_index.row_ids().len()
+            );
+        }
         Ok(batch)
     }
 
@@ -687,6 +695,7 @@ impl VectorIndex for IVFIndex {
         };
 
         let partition_ids = self.find_partitions(&query)?;
+        println!("partition list size: {:?}", partition_ids.len());
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
@@ -694,7 +703,13 @@ impl VectorIndex for IVFIndex {
             .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
+        let mut cnt = 0;
+        for i in 0..self.ivf.num_partitions() {
+            let part_idx = self.load_partition(i, false).await?;
+            cnt += part_idx.row_ids().len();
+        }
         let batch = concat_batches(&batches[0].schema(), &batches)?;
+        println!("cnt: {}\nbatch size: {:?}", cnt, batch.num_rows());
 
         let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| {
             Error::io(
@@ -1602,6 +1617,7 @@ async fn write_ivf_hnsw_file(
 
     // Convert ['Ivf'] to [`IvfData`] for new index format
     let mut ivf_data = IvfData::with_centroids(Arc::new(ivf.centroids.clone()));
+    println!("total_length: {}", aux_ivf.len());
     for length in ivf.lengths {
         ivf_data.add_partition(length);
     }
@@ -2662,7 +2678,7 @@ mod tests {
 
         let distance_type = MetricType::L2;
         let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
+        let hnsw_params = HnswBuildParams::default().parallel_limit(1);
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
             distance_type,
             ivf_params,
@@ -2685,6 +2701,7 @@ mod tests {
             .nearest("vector", query, k)
             .unwrap()
             .nprobs(nlist)
+            .refine(100)
             .try_into_stream()
             .await
             .unwrap()
@@ -2726,6 +2743,7 @@ mod tests {
             results,
             gt,
         );
+        println!("recall: {}", recall);
     }
 
     #[tokio::test]

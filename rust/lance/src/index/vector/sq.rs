@@ -62,6 +62,7 @@ pub fn build_sq_storage(
     sq: ScalarQuantizer,
 ) -> Result<ScalarQuantizationStorage> {
     let code_column = sq.transform::<Float32Type>(vectors.as_ref())?;
+    assert!(code_column.len() == vectors.len());
     std::mem::drop(vectors);
 
     let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![

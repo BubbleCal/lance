@@ -74,6 +74,13 @@ impl Quantizer {
         }
     }
 
+    pub fn dim(&self) -> usize {
+        match self {
+            Self::Product(pq) => pq.dimension(),
+            Self::Scalar(sq) => sq.dim,
+        }
+    }
+
     pub fn column(&self) -> &'static str {
         match self {
             Self::Product(pq) => pq.column(),
