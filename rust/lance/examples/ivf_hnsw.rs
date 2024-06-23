@@ -6,6 +6,7 @@
 //! run with `cargo run --release --example hnsw`
 
 use arrow::array::AsArray;
+use arrow::datatypes::Int32Type;
 use arrow_array::types::Float32Type;
 use clap::Parser;
 use futures::TryStreamExt;
@@ -75,11 +76,9 @@ async fn main() {
     let column = args.column.as_deref().unwrap_or("vector");
     let metric_type = MetricType::try_from(args.metric_type.as_str()).unwrap();
 
-    let mut ivf_params = IvfBuildParams::new(128);
+    let mut ivf_params = IvfBuildParams::new(64);
     ivf_params.sample_rate = 20480;
-    let hnsw_params = HnswBuildParams::default()
-        .ef_construction(100)
-        .num_edges(15);
+    let hnsw_params = HnswBuildParams::default();
     let pq_params = SQBuildParams::default();
     let params =
         VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf_params, hnsw_params, pq_params);
@@ -114,11 +113,14 @@ async fn main() {
         .with_row_id()
         .nearest(column, &q, args.k)
         .unwrap()
-        .nprobs(args.nprobe);
+        .nprobs(args.nprobe)
+        .filter("year >= 2000")
+        .unwrap();
     println!("{:?}", plan.explain_plan(true).await.unwrap());
 
     let now = std::time::Instant::now();
-    plan.try_into_stream()
+    let results = plan
+        .try_into_stream()
         .await
         .unwrap()
         .try_collect::<Vec<_>>()
@@ -131,21 +133,68 @@ async fn main() {
         args.k,
         now.elapsed(),
     );
+    // for r in results.iter() {
+    //     let column = r
+    //         .column_by_name("year")
+    //         .unwrap()
+    //         .as_primitive::<Int32Type>();
+    //     for v in column.values() {
+    //         assert!(*v >= 2000);
+    //     }
+    // }
 
-    let now = std::time::Instant::now();
-    for _ in 0..10 {
-        plan.try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+    for concurrency in [1, 2, 4, 8, 12, 16, 24, 32] {
+        // execute query with `concurrency` threads for 5 seconds and calculate qps and collect latencies
+        let threads = (0..concurrency)
+            .map(|_| {
+                let column = column.to_owned();
+                let q = q.clone();
+                let dataset = dataset.clone();
+                tokio::task::spawn(async move {
+                    let mut scan = dataset.scan();
+                    let plan = scan
+                        .project(columns)
+                        .unwrap()
+                        .with_row_id()
+                        .nearest(&column, &q, args.k)
+                        .unwrap()
+                        .nprobs(args.nprobe)
+                        .filter("year >= 2000")
+                        .unwrap();
+                    let mut qps = 0;
+                    let mut latencies = Vec::with_capacity(10000);
+                    let now = std::time::Instant::now();
+                    while now.elapsed().as_secs() < 5 {
+                        let now = std::time::Instant::now();
+                        plan.try_into_stream()
+                            .await
+                            .unwrap()
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap();
+                        latencies.push(now.elapsed());
+                        qps += 1;
+                    }
+                    (qps, latencies)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut qps = 0;
+        let mut latencies = Vec::with_capacity(10000);
+        for t in threads {
+            let (q, l) = t.await.unwrap();
+            qps += q;
+            latencies.extend(l);
+        }
+        qps /= 5;
+        latencies.sort();
+        let p90 = latencies[latencies.len() * 90 / 100 - 1];
+        let p95 = latencies[latencies.len() * 95 / 100 - 1];
+        let p99 = latencies[latencies.len() * 99 / 100 - 1];
+        let mean = latencies.iter().sum::<std::time::Duration>() / latencies.len() as u32;
+        println!(
+            "level={}, nprobe={}, k={}, concurrency={}, qps={}, mean={:?}, p90={:?}, p95={:?}, p99={:?}",
+            args.max_level, args.nprobe, args.k, concurrency, qps, mean, p90, p95, p99,
+        );
     }
-    println!(
-        "warm up: level={}, nprobe={}, k={}, search={:?}",
-        args.max_level,
-        args.nprobe,
-        args.k,
-        now.elapsed().div_f32(10.0),
-    );
 }
