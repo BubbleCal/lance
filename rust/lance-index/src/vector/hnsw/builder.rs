@@ -107,6 +107,12 @@ impl HnswBuildParams {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct HnswSearchStatistic {
+    pub hop_count: usize,
+    pub calculation_count: usize,
+}
+
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
@@ -172,14 +178,18 @@ impl HNSW {
         let dist_calc = storage.dist_calculator(query);
         let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let nodes = &self.nodes();
+        let mut stats = Some(HnswSearchStatistic {
+            hop_count: 0,
+            calculation_count: 0,
+        });
         for level in (0..self.max_level()).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc);
+            ep = greedy_search(&cur_level, ep, &dist_calc, &mut stats);
         }
 
         let bottom_level = HnswBottomView::new(nodes);
         let mut visited = visited_generator.generate(storage.len());
-        Ok(beam_search(
+        let results = Ok(beam_search(
             &bottom_level,
             &ep,
             ef,
@@ -187,10 +197,16 @@ impl HNSW {
             bitset.as_ref(),
             prefetch_distance,
             &mut visited,
+            &mut stats,
         )
         .into_iter()
         .take(k)
-        .collect())
+        .collect());
+
+        let stats = stats.unwrap();
+        tracing::info!(name: "HNSW search stats", ?stats);
+
+        results
     }
 
     pub fn search_basic(
@@ -364,7 +380,7 @@ impl HnswBuilder {
         let dist_calc = storage.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc);
+            ep = greedy_search(&cur_level, ep, &dist_calc, &mut None);
         }
 
         let mut pruned_neighbors_per_level: Vec<Vec<_>> =
@@ -427,6 +443,7 @@ impl HnswBuilder {
             None,
             self.params.prefetch_distance,
             &mut visited,
+            &mut None,
         )
     }
 

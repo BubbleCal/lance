@@ -18,6 +18,8 @@ use crate::vector::DIST_COL;
 
 use crate::vector::storage::DistCalculator;
 
+use super::hnsw::builder::HnswSearchStatistic;
+
 pub(crate) const NEIGHBORS_COL: &str = "__neighbors";
 
 lazy_static::lazy_static! {
@@ -233,6 +235,7 @@ pub fn beam_search(
     bitset: Option<&roaring::bitmap::RoaringBitmap>,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
+    stats: &mut Option<HnswSearchStatistic>,
 ) -> Vec<OrderedNode> {
     //let mut visited: HashSet<_> = HashSet::with_capacity(k);
     let mut candidates = BinaryHeap::with_capacity(k);
@@ -271,6 +274,9 @@ pub fn beam_search(
         let mut process_neighbor = |neighbor: u32| {
             visited.insert(neighbor);
             let dist = dist_calc.distance(neighbor).into();
+            if let Some(stats) = stats {
+                stats.calculation_count += 1;
+            }
             if dist <= furthest || results.len() < k {
                 if bitset
                     .map(|bitset| bitset.contains(neighbor))
@@ -284,6 +290,9 @@ pub fn beam_search(
                     }
                 }
                 candidates.push(Reverse((dist, neighbor).into()));
+                if let Some(stats) = stats {
+                    stats.hop_count += 1;
+                }
             }
         };
 
@@ -332,6 +341,7 @@ pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
     dist_calc: &impl DistCalculator,
+    stats: &mut Option<HnswSearchStatistic>,
 ) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
@@ -340,6 +350,9 @@ pub fn greedy_search(
         let distances = neighbors
             .iter()
             .map(|neighbor| dist_calc.distance(*neighbor));
+        if let Some(stats) = stats {
+            stats.calculation_count += neighbors.len();
+        }
 
         let mut next = None;
         for (neighbor, dist) in neighbors.iter().zip(distances) {
@@ -351,6 +364,9 @@ pub fn greedy_search(
 
         if let Some(next) = next {
             current = next;
+            if let Some(stats) = stats {
+                stats.hop_count += 1;
+            }
         } else {
             break;
         }
