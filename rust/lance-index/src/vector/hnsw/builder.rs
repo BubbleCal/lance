@@ -7,11 +7,13 @@ use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{Float32Type, UInt32Type};
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use bitvec::vec::BitVec;
 use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 
 use lance_linalg::distance::DistanceType;
+use lazy_static::lazy_static;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
@@ -41,6 +43,12 @@ use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{Query, DIST_COL, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
+lazy_static! {
+    static ref FLAT_SEARCH_THRESHOLD: usize = std::env::var("FST")
+        .unwrap_or("70".to_owned())
+        .parse::<usize>()
+        .unwrap();
+}
 
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
@@ -114,9 +122,16 @@ impl HnswBuildParams {
 /// During the build, the graph is built layer by layer.
 ///
 /// Each node in the graph has a global ID which is the index on the base layer.
-#[derive(Clone, DeepSizeOf)]
+#[derive(Clone)]
 pub struct HNSW {
     inner: Arc<HnswBuilder>,
+    bitset_pool: Arc<ArrayQueue<BitVec>>,
+}
+
+impl DeepSizeOf for HNSW {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
 }
 
 impl Debug for HNSW {
@@ -135,6 +150,7 @@ impl HNSW {
                 entry_point: 0,
                 visited_generator_queue: Arc::new(ArrayQueue::new(1)),
             }),
+            bitset_pool: Arc::new(ArrayQueue::new(1)),
         }
     }
 
@@ -164,7 +180,7 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         ef: usize,
-        bitset: Option<RoaringBitmap>,
+        bitset: Option<&BitVec>,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
@@ -184,7 +200,7 @@ impl HNSW {
             &ep,
             ef,
             &dist_calc,
-            bitset.as_ref(),
+            bitset,
             prefetch_distance,
             &mut visited,
         )
@@ -198,7 +214,7 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         ef: usize,
-        bitset: Option<RoaringBitmap>,
+        bitset: Option<&BitVec>,
         storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
         let mut visited_generator = self
@@ -577,6 +593,13 @@ impl IvfSubIndex for HNSW {
                 .push(VisitedGenerator::new(0))
                 .unwrap();
         }
+        let bitset_pool = Arc::new(ArrayQueue::new(num_cpus::get() * 2));
+        for _ in 0..(num_cpus::get() * 2) {
+            bitset_pool
+                .push(BitVec::repeat(false, nodes.len()))
+                .unwrap();
+        }
+
         let inner = HnswBuilder {
             params: hnsw_metadata.params,
             nodes: Arc::new(nodes.into_iter().map(RwLock::new).collect()),
@@ -587,6 +610,7 @@ impl IvfSubIndex for HNSW {
 
         Ok(Self {
             inner: Arc::new(inner),
+            bitset_pool,
         })
     }
 
@@ -636,44 +660,51 @@ impl IvfSubIndex for HNSW {
             None
         } else {
             let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
-            Some(
-                RoaringBitmap::from_sorted_iter(indices.into_iter().map(|i| i as u32)).map_err(
-                    |e| Error::Index {
-                        message: format!("Error creating RoaringBitmap: {}", e),
-                        location: location!(),
-                    },
-                )?,
-            )
+            let mut bitmap = self.bitset_pool.pop().unwrap();
+            bitmap.fill(false);
+            for node_id in indices {
+                bitmap.set(node_id as usize, true);
+            }
+            Some(bitmap)
         };
 
-        let keep_count = bitmap.as_ref().map(|b| b.len()).unwrap_or_default() as usize;
-        let results = if keep_count < self.len() * 80 / 100 {
-            log::info!("too many rows filtered, using flat search");
-            let bitmap = bitmap.unwrap();
+        let keep_count = bitmap
+            .as_ref()
+            .map(|b| b.count_ones())
+            .unwrap_or(storage.len());
+        let results = if keep_count < storage.len() * *FLAT_SEARCH_THRESHOLD / 100 {
+            // log::info!("fall back to flat search: {}/{}", keep_count, storage.len());
+            let bitmap = bitmap.as_ref().unwrap();
             let node_ids = storage
                 .row_ids()
                 .enumerate()
-                .filter_map(|(node_id, row_id)| {
-                    bitmap.contains(*row_id as u32).then_some(node_id as u32)
-                });
+                .filter_map(|(node_id, _)| bitmap[node_id].then_some(node_id as u32))
+                .collect_vec();
             let dist_calc = storage.dist_calculator(query);
-            let mut heap = BinaryHeap::<Reverse<OrderedNode>>::with_capacity(k);
-            for node_id in node_ids {
+            let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
+            for i in 0..node_ids.len() {
+                if let Some(ahead) = self.inner.params.prefetch_distance {
+                    if i + ahead < node_ids.len() {
+                        dist_calc.prefetch(node_ids[i + ahead]);
+                    }
+                }
+                let node_id = node_ids[i];
                 let dist = dist_calc.distance(node_id).into();
                 if heap.len() < k {
-                    heap.push(Reverse((dist, node_id).into()));
-                } else if dist < heap.peek().unwrap().0.dist {
+                    heap.push((dist, node_id).into());
+                } else if dist < heap.peek().unwrap().dist {
                     heap.pop();
-                    heap.push(Reverse((dist, node_id).into()));
+                    heap.push((dist, node_id).into());
                 }
             }
-            heap.into_iter()
-                .map(|x| x.0)
-                .sorted_unstable()
-                .collect_vec()
+            heap.into_sorted_vec()
         } else {
-            self.search_basic(query.clone(), k, params.ef, bitmap, storage)?
+            self.search_basic(query.clone(), k, params.ef, bitmap.as_ref(), storage)?
         };
+
+        if let Some(bitset) = bitmap {
+            self.bitset_pool.push(bitset).unwrap();
+        }
 
         let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| storage.row_id(x.id)));
         let distances = Arc::new(Float32Array::from_iter_values(
@@ -694,6 +725,7 @@ impl IvfSubIndex for HNSW {
         let inner = HnswBuilder::with_params(params, storage);
         let hnsw = Self {
             inner: Arc::new(inner),
+            bitset_pool: Arc::new(ArrayQueue::new(1)),
         };
 
         log::info!(

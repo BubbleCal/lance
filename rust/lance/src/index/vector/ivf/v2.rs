@@ -417,6 +417,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true).await?;
+        pre_filter.wait_for_ready().await?;
 
         let query = self.preprocess_query(partition_id, query)?;
         let param = (&query).into();

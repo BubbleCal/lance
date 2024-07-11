@@ -355,6 +355,18 @@ impl Scanner {
         Ok(self)
     }
 
+    pub fn filterv2(&mut self, filter: &Option<String>) -> Result<&mut Self> {
+        if filter.is_none() {
+            return Ok(self)
+        }
+        let filter = filter.as_ref().unwrap();
+        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
+        let planner = Planner::new(schema);
+        self.filter = Some(planner.parse_filter(filter)?);
+        self.filter = Some(planner.optimize_expr(self.filter.take().unwrap())?);
+        Ok(self)
+    }
+
     /// Set a filter using a Substrait ExtendedExpression message
     ///
     /// The message must contain exactly one expression and that expression
@@ -434,6 +446,64 @@ impl Scanner {
         }
         self.limit = limit;
         self.offset = offset;
+        Ok(self)
+    }
+
+    /// Find k-nearest neighbor within the vector column.
+    pub fn flat_nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+        self.ensure_not_fragment_scan()?;
+
+        if k == 0 {
+            return Err(Error::io("k must be positive".to_string(), location!()));
+        }
+        if q.is_empty() {
+            return Err(Error::io(
+                "Query vector must have non-zero length".to_string(),
+                location!(),
+            ));
+        }
+        // make sure the field exists
+        let field = self.dataset.schema().field(column).ok_or(Error::io(
+            format!("Column {} not found", column),
+            location!(),
+        ))?;
+        let key = match field.data_type() {
+            DataType::FixedSizeList(dt, _) => {
+                if dt.data_type().is_floating() {
+                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
+                } else {
+                    return Err(Error::io(
+                        format!(
+                            "Column {} is not a vector column (type: {})",
+                            column,
+                            field.data_type()
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::io(
+                    format!(
+                        "Column {} is not a vector column (type: {})",
+                        column,
+                        field.data_type()
+                    ),
+                    location!(),
+                ));
+            }
+        };
+
+        self.nearest = Some(Query {
+            column: column.to_string(),
+            key: key.into(),
+            k,
+            nprobes: 1,
+            ef: None,
+            refine_factor: None,
+            metric_type: MetricType::L2,
+            use_index: false,
+        });
         Ok(self)
     }
 

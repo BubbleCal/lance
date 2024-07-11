@@ -230,7 +230,7 @@ pub fn beam_search(
     ep: &OrderedNode,
     k: usize,
     dist_calc: &impl DistCalculator,
-    bitset: Option<&roaring::bitmap::RoaringBitmap>,
+    bitset: Option<&BitVec>,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
 ) -> Vec<OrderedNode> {
@@ -240,7 +240,7 @@ pub fn beam_search(
     candidates.push(Reverse(ep.clone()));
 
     let mut results = BinaryHeap::with_capacity(k);
-    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true) {
+    if bitset.map(|bitset| bitset[ep.id as usize]).unwrap_or(true) {
         results.push(ep.clone());
     }
 
@@ -272,10 +272,7 @@ pub fn beam_search(
             visited.insert(neighbor);
             let dist = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
-                if bitset
-                    .map(|bitset| bitset.contains(neighbor))
-                    .unwrap_or(true)
-                {
+                if bitset.map(|bitset| bitset[neighbor as usize]).unwrap_or(true) {
                     if results.len() < k {
                         results.push((dist, neighbor).into());
                     } else if results.len() == k && dist < results.peek().unwrap().dist {
