@@ -239,7 +239,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
         fragments: Optional[Iterable[LanceFragment]] = None,
-        full_text_query: Optional[tuple[str, str]] = None,
+        full_text_query: Optional[dict] = None,
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
@@ -339,7 +339,7 @@ class LanceDataset(pa.dataset.Dataset):
             .fast_search(fast_search)
         )
         if full_text_query is not None:
-            builder = builder.full_text_search(full_text_query[0], full_text_query[1])
+            builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
         return builder.to_scanner()
@@ -374,7 +374,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_id: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
-        full_text_query: Optional[tuple[str, str]] = None,
+        full_text_query: Optional[dict] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -495,7 +495,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
-        full_text_query: Optional[tuple[str, str]] = None,
+        full_text_query: Optional[dict] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -2253,14 +2253,20 @@ class ScannerBuilder:
         self.fast_search = flag
         return self
 
-    def full_text_search(self, column: str, query: str) -> ScannerBuilder:
+    def full_text_search(
+        self, column: str, query: str, limit: Optional[int] = None
+    ) -> ScannerBuilder:
         """
         Filter rows by full text searching. *Experimental API*,
         may remove it after we support to do this within `filter` SQL-like expression
 
         Must create inverted index on the given column before searching,
         """
-        self._full_text_query = (column, query)
+        self._full_text_query = {
+            "column": column,
+            "query": query,
+            "limit": limit,
+        }
         return self
 
     def to_scanner(self) -> LanceScanner:

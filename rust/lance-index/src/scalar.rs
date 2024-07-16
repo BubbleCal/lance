@@ -98,6 +98,32 @@ impl PartialEq for dyn AnyQuery {
     }
 }
 
+/// A full text search query
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullTextSearchQuery {
+    /// The column to search
+    pub column: String,
+    /// The full text search query
+    pub query: String,
+    /// The maximum number of results to return
+    pub limit: Option<i64>,
+}
+
+impl FullTextSearchQuery {
+    pub fn new(column: String, query: String) -> Self {
+        Self {
+            column,
+            query,
+            limit: None,
+        }
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
 /// A query that a basic scalar index (e.g. btree / bitmap) can satisfy
 ///
 /// This is a subset of expression operators that is often referred to as the
@@ -116,7 +142,7 @@ pub enum SargableQuery {
     /// Retrieve all row ids where the value is exactly the given value
     Equals(ScalarValue),
     /// Retrieve all row ids where the value matches the given full text search query
-    FullTextSearch(String),
+    FullTextSearch(FullTextSearchQuery),
     /// Retrieve all row ids where the value is null
     IsNull(),
 }
@@ -159,7 +185,7 @@ impl AnyQuery for SargableQuery {
                 )
             }
             Self::FullTextSearch(query) => {
-                format!("{}:\"{}\"", col, query)
+                format!("{}:\"{}\"", query.column, query.query)
             }
             Self::IsNull() => {
                 format!("{} IS NULL", col)
@@ -208,8 +234,8 @@ impl AnyQuery for SargableQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(value) => {
-                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(value.clone()))))
+            Self::FullTextSearch(query) => {
+                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(query.query.clone()))))
             }
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),

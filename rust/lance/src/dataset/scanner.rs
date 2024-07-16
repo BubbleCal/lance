@@ -31,10 +31,9 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
-use lance_core::datatypes::Field;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
-use lance_index::scalar::SargableQuery;
+use lance_index::scalar::{FullTextSearchQuery, SargableQuery};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -140,7 +139,7 @@ pub struct Scanner {
     pub(crate) filter: Option<Expr>,
 
     /// Optional full text search query
-    full_text_query: Option<(Field, String)>,
+    full_text_query: Option<FullTextSearchQuery>,
 
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
@@ -374,12 +373,19 @@ impl Scanner {
     ///    .limit(10)
     ///    .into_stream();
     /// ```
-    pub fn full_text_search(&mut self, column: &str, query: &str) -> Result<&mut Self> {
-        let column = self.dataset.schema().field(column).ok_or(Error::io(
-            format!("Column {} not found", column),
+    pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
+        self.dataset.schema().field(&query.column).ok_or(Error::io(
+            format!("Column {} not found", query.column),
             location!(),
         ))?;
-        self.full_text_query = Some((column.to_owned(), query.to_owned()));
+
+        let query = if let Some(limit) = self.limit {
+            query.limit(limit)
+        } else {
+            query
+        };
+
+        self.full_text_query = Some(query);
         Ok(self)
     }
 
@@ -462,6 +468,11 @@ impl Scanner {
         }
         self.limit = limit;
         self.offset = offset;
+
+        if let Some(query) = &mut self.full_text_query {
+            query.limit = limit;
+        }
+
         Ok(self)
     }
 
@@ -911,9 +922,9 @@ impl Scanner {
             FilterPlan::default()
         };
 
-        if let Some((field, query)) = &self.full_text_query {
+        if let Some(query) = &self.full_text_query {
             let full_text_search_index_expr = ScalarIndexExpr::Query(
-                field.name.clone(),
+                query.column.clone(),
                 Arc::new(SargableQuery::FullTextSearch(query.clone())),
             );
             let scalar_index_query = match filter_plan.index_query {
