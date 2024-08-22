@@ -350,9 +350,6 @@ struct InvertedListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
     max_scores: Option<Vec<f32>>,
-
-    // cache
-    posting_cache: Cache<u32, PostingList>,
 }
 
 impl std::fmt::Debug for InvertedListReader {
@@ -366,8 +363,6 @@ impl std::fmt::Debug for InvertedListReader {
 impl DeepSizeOf for InvertedListReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.offsets.deep_size_of_children(context)
-            // + self.lengths.deep_size_of_children(context)
-            + self.posting_cache.weighted_size() as usize
     }
 }
 
@@ -385,15 +380,10 @@ impl InvertedListReader {
             None => None,
         };
 
-        let cache = Cache::builder()
-            .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
-            .build();
         Ok(Self {
             reader,
             offsets,
             max_scores,
-            posting_cache: cache,
         })
     }
 
@@ -409,24 +399,19 @@ impl InvertedListReader {
 
     #[instrument(level = "debug", skip(self))]
     pub(crate) async fn posting_list(&self, token_id: u32) -> Result<PostingList> {
-        self.posting_cache
-            .try_get_with(token_id, async move {
-                let length = self.posting_len(token_id);
-                let token_id = token_id as usize;
-                let offset = self.offsets[token_id];
-                let batch = self.reader.read_range(offset..offset + length).await?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
-                Result::Ok(PostingList::new(
-                    row_ids.values().clone(),
-                    frequencies.values().clone(),
-                    self.max_scores
-                        .as_ref()
-                        .map(|max_scores| max_scores[token_id]),
-                ))
-            })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))
+        let length = self.posting_len(token_id);
+        let token_id = token_id as usize;
+        let offset = self.offsets[token_id];
+        let batch = self.reader.read_range(offset..offset + length).await?;
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+        let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
+        Result::Ok(PostingList::new(
+            row_ids.values().clone(),
+            frequencies.values().clone(),
+            self.max_scores
+                .as_ref()
+                .map(|max_scores| max_scores[token_id]),
+        ))
     }
 }
 
