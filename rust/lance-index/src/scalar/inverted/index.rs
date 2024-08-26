@@ -409,32 +409,26 @@ impl InvertedListReader {
         token_id: u32,
         is_phrase_query: bool,
     ) -> Result<PostingList> {
-        let mut posting = self
-            .posting_cache
-            .try_get_with(token_id, async move {
-                let length = self.posting_len(token_id);
-                let token_id = token_id as usize;
-                let offset = self.offsets[token_id];
-                let batch = self
-                    .reader
-                    .read_range(offset..offset + length, Some(&[ROW_ID, FREQUENCY_COL]))
-                    .await?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
-                Result::Ok(PostingList::new(
-                    row_ids.values().clone(),
-                    frequencies.values().clone(),
-                    self.max_scores
-                        .as_ref()
-                        .map(|max_scores| max_scores[token_id]),
-                ))
-            })
-            .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?;
+        let length = self.posting_len(token_id);
+        let token_id = token_id as usize;
+        let offset = self.offsets[token_id];
+        let batch = self
+            .reader
+            .read_range(offset..offset + length, Some(&[ROW_ID, FREQUENCY_COL]))
+            .await?;
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+        let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
+        let mut posting = PostingList::new(
+            row_ids.values().clone(),
+            frequencies.values().clone(),
+            self.max_scores
+                .as_ref()
+                .map(|max_scores| max_scores[token_id]),
+        );
 
         if is_phrase_query {
             // hit the cache and when the cache was populated, the positions column was not loaded
-            let positions = self.read_positions(token_id).await?;
+            let positions = self.read_positions(token_id as u32).await?;
             posting.positions = Some(positions);
         }
 
