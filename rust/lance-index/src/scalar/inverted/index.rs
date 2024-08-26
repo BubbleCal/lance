@@ -58,7 +58,7 @@ lazy_static! {
     pub static ref TOKENIZER: tantivy::tokenizer::TextAnalyzer = {
         tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
             .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
-            .filter(tantivy::tokenizer::StopWordFilter::new(Language::English).unwrap())
+            // .filter(tantivy::tokenizer::StopWordFilter::new(Language::English).unwrap())
             .filter(tantivy::tokenizer::LowerCaser)
             .filter(tantivy::tokenizer::Stemmer::new(Language::English))
             .build()
@@ -286,7 +286,6 @@ impl TokenSet {
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
             arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
-            arrow_schema::Field::new(FREQUENCY_COL, DataType::UInt64, false),
         ]);
 
         let batch = RecordBatch::try_new(
@@ -529,7 +528,7 @@ impl Default for PostingListBuilder {
         Self {
             row_ids: Vec::new(),
             frequencies: Vec::new(),
-            positions: Some(Vec::new()),
+            positions: None,
         }
     }
 }
