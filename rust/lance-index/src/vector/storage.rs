@@ -3,6 +3,7 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+use std::ops::Range;
 use std::{any::Any, sync::Arc};
 
 use arrow::compute::concat_batches;
@@ -38,6 +39,12 @@ use super::DISTANCE_TYPE_KEY;
 /// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
+    fn batch_distance(&self, ids: &[u32]) -> Vec<f32> {
+        ids.iter().map(|&id| self.distance(id)).collect()
+    }
+    fn range_distance(&self, ids: Range<u32>) -> Vec<f32> {
+        ids.map(|id| self.distance(id)).collect()
+    }
     fn prefetch(&self, _id: u32) {}
 }
 
