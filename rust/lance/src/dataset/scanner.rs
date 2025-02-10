@@ -2155,20 +2155,9 @@ impl Scanner {
             expressions::col(ROW_ID, schema.as_ref())?,
             ROW_ID.to_string(),
         )];
-        // for now multivector is always with cosine distance so here convert the distance to `1 - distance`
-        // and calculate the sum across all rows with the same row id.
-        let sum_expr = AggregateExprBuilder::new(
-            functions_aggregate::sum::sum_udaf(),
-            vec![expressions::binary(
-                expressions::lit(1.0),
-                datafusion_expr::Operator::Minus,
-                expressions::cast(
-                    expressions::col(DIST_COL, &schema)?,
-                    &schema,
-                    DataType::Float64,
-                )?,
-                &schema,
-            )?],
+        let min_expr = AggregateExprBuilder::new(
+            functions_aggregate::min_max::min_udaf(),
+            vec![expressions::col(DIST_COL, &schema)?],
         )
         .schema(schema.clone())
         .alias(DIST_COL)
@@ -2176,7 +2165,7 @@ impl Scanner {
         let ann_node: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::new_single(group_expr),
-            vec![Arc::new(sum_expr)],
+            vec![Arc::new(min_expr)],
             vec![None],
             ann_node,
             schema,
@@ -2185,7 +2174,7 @@ impl Scanner {
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
             options: SortOptions {
-                descending: true,
+                descending: false,
                 nulls_first: false,
             },
         };
