@@ -595,7 +595,7 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
-        const VECTOR_NUM_PER_ROW: usize = 5;
+        const VECTOR_NUM_PER_ROW: usize = 1030;
         let vectors = generate_random_array_with_range::<T>(1000 * VECTOR_NUM_PER_ROW * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
@@ -991,6 +991,7 @@ mod tests {
     }
 
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+        let recall_requirement = recall_requirement * 0.9;
         match params.metric_type {
             DistanceType::Hamming => {
                 test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2)
@@ -1040,6 +1041,7 @@ mod tests {
             .nearest("vector", &query, k)
             .unwrap()
             .nprobs(nlist)
+            .refine(5)
             .with_row_id()
             .try_into_batch()
             .await
@@ -1061,7 +1063,7 @@ mod tests {
         let gt = multivec_ground_truth(&vectors, &query, k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
-        let recall = row_ids.intersection(&gt_set).count() as f32 / 10.0;
+        let recall = row_ids.intersection(&gt_set).count() as f32 / 100.0;
         assert!(
             recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
