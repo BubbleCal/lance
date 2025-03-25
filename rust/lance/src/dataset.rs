@@ -3522,6 +3522,22 @@ mod tests {
         assert_eq!(fragments[0].id(), 0);
         assert_eq!(fragments[1].id(), 2);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+
+        // Delete again so that only one row left
+        let data = sequence_data(0..100);
+        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        dataset.delete("i > 0").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+        if with_scalar_index {
+            assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+        }
     }
 
     #[rstest]
