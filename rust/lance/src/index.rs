@@ -457,26 +457,9 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let loaded_indices: Vec<IndexMetadata> =
+        let loaded_indices =
             read_manifest_indexes(&self.object_store, &self.manifest_location, &self.manifest)
-                .await?
-                .into_iter()
-                .filter(|idx| {
-                    let max_valid_version = infer_index_type(idx)
-                        .map(|t| t.version())
-                        .unwrap_or_default();
-                    let is_valid = idx.index_version <= max_valid_version;
-                    if !is_valid {
-                        log::warn!(
-                            "Index {} has version {}, which is not supported (<={}), ignoring it",
-                            idx.name,
-                            idx.index_version,
-                            max_valid_version,
-                        );
-                    }
-                    is_valid
-                })
-                .collect();
+                .await?;
         let loaded_indices = Arc::new(loaded_indices);
 
         self.session.index_cache.insert_metadata(

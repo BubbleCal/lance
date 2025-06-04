@@ -470,23 +470,6 @@ fn best_effort_scalar_index_type(index: &Index) -> Result<Option<ScalarIndexType
     Ok(None)
 }
 
-/// Infers the index type from the index details, if available.
-/// Returns None if the index details are not present or the type cannot be determined.
-/// This returns IndexType::Vector for all vector index types.
-pub fn infer_index_type(index: &Index) -> Option<IndexType> {
-    if let Some(details) = &index.index_details {
-        if let Ok(Some(details)) = get_scalar_index_details(details) {
-            return Some(details.get_type().into());
-        } else if let Ok(Some(_)) = get_vector_index_details(details) {
-            return Some(IndexType::Vector);
-        } else {
-            // If the details are not recognized, we return None
-            return None;
-        }
-    }
-    None
-}
-
 pub fn index_matches_criteria(
     index: &Index,
     criteria: &ScalarIndexCriteria,

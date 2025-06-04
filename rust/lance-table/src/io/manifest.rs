@@ -126,14 +126,51 @@ pub async fn read_manifest_indexes(
         };
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
-        Ok(section
+        let indices = section
             .indices
             .into_iter()
             .map(Index::try_from)
-            .collect::<Result<Vec<_>>>()?)
+            .collect::<Result<Vec<_>>>()?;
+
+        let indices = indices
+            .into_iter()
+            .filter(|idx| {
+                let max_valid_version = infer_index_type(idx)
+                    .map(|t| t.version())
+                    .unwrap_or_default();
+                let is_valid = idx.index_version <= max_valid_version;
+                if !is_valid {
+                    log::warn!(
+                        "Index {} has version {}, which is not supported (<={}), ignoring it",
+                        idx.name,
+                        idx.index_version,
+                        max_valid_version,
+                    );
+                }
+                is_valid
+            })
+            .collect();
+        Ok(indices)
     } else {
         Ok(vec![])
     }
+}
+
+/// Infers the index type from the index details, if available.
+/// Returns None if the index details are not present or the type cannot be determined.
+/// This returns IndexType::Vector for all vector index types.
+pub fn infer_index_type(index: &Index) -> Option<IndexType> {
+    if let Some(details) = &index.index_details {
+        if let Ok(Some(details)) = get_scalar_index_details(details) {
+            return Some(details.get_type().into());
+        } else if let Ok(Some(_)) = get_vector_index_details(details) {
+            return Some(IndexType::Vector);
+        } else {
+            // If the details are not recognized, we return None
+            return None;
+        }
+    }
+    None
 }
 
 async fn do_write_manifest(
