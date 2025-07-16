@@ -222,9 +222,7 @@ impl lance_index::scalar::btree::TrainingSource for MockTrainingSource {
 criterion_group!(
     name=benches;
     config = Criterion::default()
-        .measurement_time(Duration::from_secs(10))
-        .sample_size(10)
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+        .measurement_time(Duration::from_secs(10));
     targets = bench_btree_search);
 
 // Non-linux version does not support pprof.
