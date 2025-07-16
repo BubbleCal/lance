@@ -31,7 +31,7 @@ use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 
 fn bench_btree_search(c: &mut Criterion) {
-    const TOTAL: usize = 5_000_000;
+    const TOTAL: usize = 1_000_000;
     const BATCH_SIZE: u32 = 4096;
 
     let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
