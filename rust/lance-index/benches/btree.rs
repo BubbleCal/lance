@@ -39,8 +39,7 @@ fn bench_btree_search(c: &mut Criterion) {
     // Test different data types
     let test_cases = vec![
         ("int32_random", gen_int32_random(TOTAL)),
-        ("float64_random", gen_float64_random(TOTAL)),
-        ("string_random", gen_string_random(TOTAL)),
+        ("float32_random", gen_float32_random(TOTAL)),
     ];
 
     for (name, data) in test_cases {
@@ -80,10 +79,7 @@ fn bench_btree_search(c: &mut Criterion) {
             b.to_async(&rt).iter(|| async {
                 let query_value = match name {
                     "int32_random" => SargableQuery::Equals(ScalarValue::Int32(Some(500000))),
-                    "float64_random" => SargableQuery::Equals(ScalarValue::Float64(Some(500000.0))),
-                    "string_random" => {
-                        SargableQuery::Equals(ScalarValue::Utf8(Some("value_500000".to_string())))
-                    }
+                    "float32_random" => SargableQuery::Equals(ScalarValue::Float32(Some(500000.0))),
                     _ => unreachable!(),
                 };
                 black_box(
@@ -103,13 +99,9 @@ fn bench_btree_search(c: &mut Criterion) {
                         Bound::Included(ScalarValue::Int32(Some(100000))),
                         Bound::Excluded(ScalarValue::Int32(Some(200000))),
                     ),
-                    "float64_random" => SargableQuery::Range(
-                        Bound::Included(ScalarValue::Float64(Some(100000.0))),
-                        Bound::Excluded(ScalarValue::Float64(Some(200000.0))),
-                    ),
-                    "string_random" => SargableQuery::Range(
-                        Bound::Included(ScalarValue::Utf8(Some("value_100000".to_string()))),
-                        Bound::Excluded(ScalarValue::Utf8(Some("value_200000".to_string()))),
+                    "float32_random" => SargableQuery::Range(
+                        Bound::Included(ScalarValue::Float32(Some(100000.0))),
+                        Bound::Excluded(ScalarValue::Float32(Some(200000.0))),
                     ),
                     _ => unreachable!(),
                 };
@@ -133,19 +125,12 @@ fn bench_btree_search(c: &mut Criterion) {
                         ScalarValue::Int32(Some(400000)),
                         ScalarValue::Int32(Some(500000)),
                     ]),
-                    "float64_random" => SargableQuery::IsIn(vec![
-                        ScalarValue::Float64(Some(100000.0)),
-                        ScalarValue::Float64(Some(200000.0)),
-                        ScalarValue::Float64(Some(300000.0)),
-                        ScalarValue::Float64(Some(400000.0)),
-                        ScalarValue::Float64(Some(500000.0)),
-                    ]),
-                    "string_random" => SargableQuery::IsIn(vec![
-                        ScalarValue::Utf8(Some("value_100000".to_string())),
-                        ScalarValue::Utf8(Some("value_200000".to_string())),
-                        ScalarValue::Utf8(Some("value_300000".to_string())),
-                        ScalarValue::Utf8(Some("value_400000".to_string())),
-                        ScalarValue::Utf8(Some("value_500000".to_string())),
+                    "float32_random" => SargableQuery::IsIn(vec![
+                        ScalarValue::Float32(Some(100000.0)),
+                        ScalarValue::Float32(Some(200000.0)),
+                        ScalarValue::Float32(Some(300000.0)),
+                        ScalarValue::Float32(Some(400000.0)),
+                        ScalarValue::Float32(Some(500000.0)),
                     ]),
                     _ => unreachable!(),
                 };
@@ -189,23 +174,16 @@ fn gen_int32_random(total: usize) -> datafusion::execution::SendableRecordBatchS
         .into_df_stream(RowCount::from(total as u64), BatchCount::from(100))
 }
 
-fn gen_float64_random(total: usize) -> datafusion::execution::SendableRecordBatchStream {
+fn gen_float32_random(total: usize) -> datafusion::execution::SendableRecordBatchStream {
     let mut rng = rand::thread_rng();
-    let values: Vec<f64> = (0..total)
-        .map(|_| rng.gen_range(0.0..total as f64))
+    let values: Vec<f32> = (0..total)
+        .map(|_| rng.gen_range(0.0..total as f32))
         .collect();
     gen()
         .col(
             "values",
-            array::cycle::<arrow::datatypes::Float64Type>(values),
+            array::cycle::<arrow::datatypes::Float32Type>(values),
         )
-        .col("row_ids", array::step::<arrow::datatypes::UInt64Type>())
-        .into_df_stream(RowCount::from(total as u64), BatchCount::from(100))
-}
-
-fn gen_string_random(total: usize) -> datafusion::execution::SendableRecordBatchStream {
-    gen()
-        .col("values", array::random_sentence(1, 1, false))
         .col("row_ids", array::step::<arrow::datatypes::UInt64Type>())
         .into_df_stream(RowCount::from(total as u64), BatchCount::from(100))
 }
@@ -247,7 +225,7 @@ criterion_group!(
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_btree_search, bench_btree_cache_effects, bench_btree_different_sizes);
+    targets = bench_btree_search);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
