@@ -543,6 +543,7 @@ impl Ord for OrderableScalarValue {
 
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 struct PageRecord {
+    min: OrderableScalarValue,
     max: OrderableScalarValue,
     page_number: u32,
 }
@@ -561,14 +562,17 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
-    tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
+    page_records: Vec<PageRecord>,
     /// Pages where the value may be null
     null_pages: Vec<u32>,
 }
 
 impl BTreeLookup {
-    fn new(tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>, null_pages: Vec<u32>) -> Self {
-        Self { tree, null_pages }
+    fn new(page_records: Vec<PageRecord>, null_pages: Vec<u32>) -> Self {
+        Self {
+            page_records,
+            null_pages,
+        }
     }
 
     // All pages that could have a value equal to val
@@ -576,7 +580,7 @@ impl BTreeLookup {
         if query.0.is_null() {
             self.pages_null()
         } else {
-            self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+            self.pages_between((Bound::Included(query), Bound::Included(query)))
         }
     }
 
@@ -604,27 +608,27 @@ impl BTreeLookup {
         // We need to grab a little bit left of the given range because the query might be 7
         // and the first page might be something like 5-10.
         let lower_bound = match range.0 {
-            Bound::Unbounded => Bound::Unbounded,
+            Bound::Unbounded => 0,
             // It doesn't matter if the bound is exclusive or inclusive.  We are going to grab
             // the first node whose min is strictly less than the given bound.  Then we grab
             // all nodes greater than or equal to that
             //
             // We have to peek a bit to the left because we might have something like a lower
             // bound of 7 and there is a page [5-10] we want to search for.
-            Bound::Included(lower) => self
-                .tree
-                .largest_node_less(lower)
-                .map(|val| Bound::Included(val.0))
-                .unwrap_or(Bound::Unbounded),
-            Bound::Excluded(lower) => self
-                .tree
-                .largest_node_less(lower)
-                .map(|val| Bound::Included(val.0))
-                .unwrap_or(Bound::Unbounded),
+            Bound::Included(lower) => self.page_start(lower),
+            Bound::Excluded(lower) => {
+                let mut start = self.page_start(lower);
+                while start < self.page_records.len()
+                    && self.page_records[start].max.cmp(lower) == Ordering::Equal
+                {
+                    start += 1
+                }
+                start
+            }
         };
         let upper_bound = match range.1 {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(upper) => Bound::Included(upper),
+            Bound::Unbounded => self.page_records.len(),
+            Bound::Included(upper) => self.page_end(upper),
             // Even if the upper bound is excluded we need to include it on an [x, x) query.  This is because the
             // query might be [x, x).  Our lower bound might find some [a-x] bucket and we still
             // want to include any [x, z] bucket.
@@ -633,46 +637,40 @@ impl BTreeLookup {
             // is defined, inclusive, and equal to the upper bound.  However, let's keep it simple for now.  This
             // should only affect the probably rare case that our query is a true range query and the value
             // matches an upper bound.  This will all be moot if/when we merge pages.
-            Bound::Excluded(upper) => Bound::Included(upper),
+            Bound::Excluded(upper) => {
+                let mut end = self.page_end(upper);
+                while end > 0 && self.page_records[end - 1].min.cmp(upper) == Ordering::Equal {
+                    end -= 1;
+                }
+                end
+            }
         };
 
-        match (lower_bound, upper_bound) {
-            (Bound::Excluded(lower), Bound::Excluded(upper))
-            | (Bound::Excluded(lower), Bound::Included(upper))
-            | (Bound::Included(lower), Bound::Excluded(upper)) => {
-                // It's not really clear what (Included(5), Excluded(5)) would mean so we
-                // interpret it as an empty range which matches rust's BTreeMap behavior
-                if lower >= upper {
-                    return vec![];
-                }
-            }
-            (Bound::Included(lower), Bound::Included(upper)) => {
-                if lower > upper {
-                    return vec![];
-                }
-            }
-            _ => {}
+        if lower_bound >= upper_bound {
+            return vec![];
         }
 
-        let candidates = self
-            .tree
-            .range((lower_bound, upper_bound))
-            .flat_map(|val| val.1);
-        match lower_bound {
-            Bound::Unbounded => candidates.map(|val| val.page_number).collect(),
-            Bound::Included(lower_bound) => candidates
-                .filter(|val| val.max.cmp(lower_bound) != Ordering::Less)
-                .map(|val| val.page_number)
-                .collect(),
-            Bound::Excluded(lower_bound) => candidates
-                .filter(|val| val.max.cmp(lower_bound) == Ordering::Greater)
-                .map(|val| val.page_number)
-                .collect(),
-        }
+        (lower_bound..upper_bound).map(|page| page as u32).collect()
+        // self.page_records[lower_bound..upper_bound]
+        //     .iter()
+        //     .map(|page| page.page_number)
+        //     .collect()
     }
 
     fn pages_null(&self) -> Vec<u32> {
         self.null_pages.clone()
+    }
+
+    fn page_start(&self, value: &OrderableScalarValue) -> usize {
+        // find the first page whose max is greater than or equal to the value
+        self.page_records
+            .partition_point(|page| page.max.cmp(value) == Ordering::Less)
+    }
+
+    fn page_end(&self, value: &OrderableScalarValue) -> usize {
+        // find the first page whose min is greater than the value
+        self.page_records
+            .partition_point(|page| page.min.cmp(value) != Ordering::Greater)
     }
 }
 
@@ -739,7 +737,7 @@ pub struct BTreeIndex {
 
 impl BTreeIndex {
     fn new(
-        tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
+        tree: Vec<PageRecord>,
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
         sub_index: Arc<dyn BTreeSubIndex>,
@@ -828,14 +826,19 @@ impl BTreeIndex {
         batch_size: u64,
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
+        let mut page_records = Vec::with_capacity(data.num_rows().div_ceil(batch_size as usize));
         let mut null_pages = Vec::<u32>::new();
 
         if data.num_rows() == 0 {
             let data_type = data.column(0).data_type().clone();
             let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
             return Ok(Self::new(
-                map, null_pages, store, sub_index, batch_size, fri,
+                page_records,
+                null_pages,
+                store,
+                sub_index,
+                batch_size,
+                fri,
             ));
         }
 
@@ -858,11 +861,26 @@ impl BTreeIndex {
             let null_count = null_counts.values()[idx];
             let page_number = page_numbers.values()[idx];
 
+            assert_eq!(page_number, idx as u32);
+            assert!(
+                min.cmp(&max) != Ordering::Greater,
+                "min: {:?}, max: {:?}",
+                min,
+                max
+            );
+
             // If the page is entirely null don't even bother putting it in the tree
             if !max.0.is_null() {
-                map.entry(min)
-                    .or_default()
-                    .push(PageRecord { max, page_number });
+                if let Some(last) = page_records.last() {
+                    assert!(last.min.cmp(&min) != Ordering::Greater);
+                    assert!(last.max.cmp(&max) != Ordering::Greater);
+                }
+
+                page_records.push(PageRecord {
+                    min,
+                    max,
+                    page_number,
+                });
             }
 
             if null_count > 0 {
@@ -870,16 +888,18 @@ impl BTreeIndex {
             }
         }
 
-        let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
-        map.entry(OrderableScalarValue(last_max)).or_default();
-
         let data_type = mins.data_type();
 
         // TODO: Support other page types?
         let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
 
         Ok(Self::new(
-            map, null_pages, store, sub_index, batch_size, fri,
+            page_records,
+            null_pages,
+            store,
+            sub_index,
+            batch_size,
+            fri,
         ))
     }
 
@@ -975,16 +995,16 @@ impl Index for BTreeIndex {
     fn statistics(&self) -> Result<serde_json::Value> {
         let min = self
             .page_lookup
-            .tree
-            .first_key_value()
-            .map(|(k, _)| k.clone());
+            .page_records
+            .first()
+            .map(|page| page.min.clone());
         let max = self
             .page_lookup
-            .tree
-            .last_key_value()
-            .map(|(k, _)| k.clone());
+            .page_records
+            .last()
+            .map(|page| page.max.clone());
         serde_json::to_value(&BTreeStatistics {
-            num_pages: self.page_lookup.tree.len() as u32,
+            num_pages: self.page_lookup.page_records.len() as u32,
             min,
             max,
         })
@@ -1143,6 +1163,14 @@ fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
             message: format!("failed to get max value from batch: {}", e),
             location: location!(),
         })?;
+
+    assert!(
+        min.partial_cmp(&max) != Some(Ordering::Greater),
+        "min: {:?}, max: {:?}\nvalues: {:?}",
+        min,
+        max,
+        values
+    );
 
     Ok(BatchStats {
         min,
@@ -1587,7 +1615,8 @@ mod tests {
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             assert_eq!(
                 result,
-                SearchResult::Exact(RowIdTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
+                SearchResult::Exact(RowIdTreeMap::from_iter(((idx as u64)..1000).step_by(7))),
+                "value: {value}"
             );
         }
     }
