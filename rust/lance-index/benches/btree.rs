@@ -26,9 +26,6 @@ use lance_index::scalar::{SargableQuery, ScalarIndex};
 use lance_index::Index;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-#[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
-use rand::Rng;
 
 fn bench_btree_search(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;
@@ -38,8 +35,8 @@ fn bench_btree_search(c: &mut Criterion) {
 
     // Test different data types
     let test_cases = vec![
-        ("int32_random", gen_int32_random(TOTAL)),
-        ("float32_random", gen_float32_random(TOTAL)),
+        ("int32_random", gen_int32_random(TOTAL, BATCH_SIZE)),
+        ("float32_random", gen_float32_random(TOTAL, BATCH_SIZE)),
     ];
 
     for (name, data) in test_cases {
@@ -162,30 +159,30 @@ fn bench_btree_search(c: &mut Criterion) {
 
 // Helper functions to generate different types of test data
 
-fn gen_int32_random(total: usize) -> datafusion::execution::SendableRecordBatchStream {
-    let mut rng = rand::thread_rng();
-    let values: Vec<i32> = (0..total).map(|_| rng.gen_range(0..total as i32)).collect();
+fn gen_int32_random(
+    total: usize,
+    batch_size: u32,
+) -> datafusion::execution::SendableRecordBatchStream {
     gen()
-        .col(
-            "values",
-            array::cycle::<arrow::datatypes::Int32Type>(values),
-        )
+        .col("values", array::step::<arrow::datatypes::Int32Type>())
         .col("row_ids", array::step::<arrow::datatypes::UInt64Type>())
-        .into_df_stream(RowCount::from(total as u64), BatchCount::from(100))
+        .into_df_stream(
+            RowCount::from(batch_size as u64),
+            BatchCount::from(total.div_ceil(batch_size as usize) as u32),
+        )
 }
 
-fn gen_float32_random(total: usize) -> datafusion::execution::SendableRecordBatchStream {
-    let mut rng = rand::thread_rng();
-    let values: Vec<f32> = (0..total)
-        .map(|_| rng.gen_range(0.0..total as f32))
-        .collect();
+fn gen_float32_random(
+    total: usize,
+    batch_size: u32,
+) -> datafusion::execution::SendableRecordBatchStream {
     gen()
-        .col(
-            "values",
-            array::cycle::<arrow::datatypes::Float32Type>(values),
-        )
+        .col("values", array::step::<arrow::datatypes::Float32Type>())
         .col("row_ids", array::step::<arrow::datatypes::UInt64Type>())
-        .into_df_stream(RowCount::from(total as u64), BatchCount::from(100))
+        .into_df_stream(
+            RowCount::from(batch_size as u64),
+            BatchCount::from(total.div_ceil(batch_size as usize) as u32),
+        )
 }
 
 // Mock training source for the benchmark

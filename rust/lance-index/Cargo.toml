@@ -135,9 +135,5 @@ harness = false
 name = "btree"
 harness = false
 
-[[bench]]
-name = "pages_between"
-harness = false
-
 [lints]
 workspace = true
