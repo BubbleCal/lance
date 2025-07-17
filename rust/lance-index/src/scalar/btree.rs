@@ -605,45 +605,15 @@ impl BTreeLookup {
         &self,
         range: (Bound<&OrderableScalarValue>, Bound<&OrderableScalarValue>),
     ) -> Vec<u32> {
-        // We need to grab a little bit left of the given range because the query might be 7
-        // and the first page might be something like 5-10.
         let lower_bound = match range.0 {
             Bound::Unbounded => 0,
-            // It doesn't matter if the bound is exclusive or inclusive.  We are going to grab
-            // the first node whose min is strictly less than the given bound.  Then we grab
-            // all nodes greater than or equal to that
-            //
-            // We have to peek a bit to the left because we might have something like a lower
-            // bound of 7 and there is a page [5-10] we want to search for.
-            Bound::Included(lower) => self.page_start(lower),
-            Bound::Excluded(lower) => {
-                let mut start = self.page_start(lower);
-                while start < self.page_records.len()
-                    && self.page_records[start].max.cmp(lower) == Ordering::Equal
-                {
-                    start += 1
-                }
-                start
-            }
+            Bound::Included(lower) => self.page_start(lower, true),
+            Bound::Excluded(lower) => self.page_start(lower, false),
         };
         let upper_bound = match range.1 {
             Bound::Unbounded => self.page_records.len(),
-            Bound::Included(upper) => self.page_end(upper),
-            // Even if the upper bound is excluded we need to include it on an [x, x) query.  This is because the
-            // query might be [x, x).  Our lower bound might find some [a-x] bucket and we still
-            // want to include any [x, z] bucket.
-            //
-            // We could be slightly more accurate here and only include the upper bound if the lower bound
-            // is defined, inclusive, and equal to the upper bound.  However, let's keep it simple for now.  This
-            // should only affect the probably rare case that our query is a true range query and the value
-            // matches an upper bound.  This will all be moot if/when we merge pages.
-            Bound::Excluded(upper) => {
-                let mut end = self.page_end(upper);
-                while end > 0 && self.page_records[end - 1].min.cmp(upper) == Ordering::Equal {
-                    end -= 1;
-                }
-                end
-            }
+            Bound::Included(upper) => self.page_end(upper, true),
+            Bound::Excluded(upper) => self.page_end(upper, false),
         };
 
         if lower_bound >= upper_bound {
@@ -651,26 +621,30 @@ impl BTreeLookup {
         }
 
         (lower_bound..upper_bound).map(|page| page as u32).collect()
-        // self.page_records[lower_bound..upper_bound]
-        //     .iter()
-        //     .map(|page| page.page_number)
-        //     .collect()
     }
 
     fn pages_null(&self) -> Vec<u32> {
         self.null_pages.clone()
     }
 
-    fn page_start(&self, value: &OrderableScalarValue) -> usize {
-        // find the first page whose max is greater than or equal to the value
-        self.page_records
-            .partition_point(|page| page.max.cmp(value) == Ordering::Less)
+    fn page_start(&self, value: &OrderableScalarValue, inclusive: bool) -> usize {
+        if inclusive {
+            self.page_records
+                .partition_point(|page| page.max.cmp(value) == Ordering::Less)
+        } else {
+            self.page_records
+                .partition_point(|page| page.max.cmp(value) != Ordering::Greater)
+        }
     }
 
-    fn page_end(&self, value: &OrderableScalarValue) -> usize {
-        // find the first page whose min is greater than the value
-        self.page_records
-            .partition_point(|page| page.min.cmp(value) != Ordering::Greater)
+    fn page_end(&self, value: &OrderableScalarValue, inclusive: bool) -> usize {
+        if inclusive {
+            self.page_records
+                .partition_point(|page| page.min.cmp(value) != Ordering::Greater)
+        } else {
+            self.page_records
+                .partition_point(|page| page.min.cmp(value) == Ordering::Less)
+        }
     }
 }
 
