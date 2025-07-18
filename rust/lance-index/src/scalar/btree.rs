@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::HashMap,
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -548,17 +548,6 @@ struct PageRecord {
     page_number: u32,
 }
 
-trait BTreeMapExt<K, V> {
-    fn largest_node_less(&self, key: &K) -> Option<(&K, &V)>;
-}
-
-impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
-    fn largest_node_less(&self, key: &K) -> Option<(&K, &V)> {
-        self.range((Bound::Unbounded, Bound::Excluded(key)))
-            .next_back()
-    }
-}
-
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
@@ -586,18 +575,15 @@ impl BTreeLookup {
 
     // All pages that could have a value equal to one of the values
     fn pages_in(&self, values: impl IntoIterator<Item = OrderableScalarValue>) -> Vec<u32> {
-        let page_lists = values
+        let mut page_lists = values
             .into_iter()
             .map(|val| self.pages_eq(&val))
+            .flatten()
             .collect::<Vec<_>>();
-        let total_size = page_lists.iter().map(|set| set.len()).sum();
-        let mut heap = BinaryHeap::with_capacity(total_size);
-        for page_list in page_lists {
-            heap.extend(page_list);
-        }
-        let mut all_pages = heap.into_sorted_vec();
-        all_pages.dedup();
-        all_pages
+
+        page_lists.sort_unstable();
+        page_lists.dedup();
+        page_lists
     }
 
     // All pages that could have a value in the range
@@ -627,6 +613,7 @@ impl BTreeLookup {
         self.null_pages.clone()
     }
 
+    #[inline(always)]
     fn page_start(&self, value: &OrderableScalarValue, inclusive: bool) -> usize {
         if inclusive {
             self.page_records
@@ -637,6 +624,7 @@ impl BTreeLookup {
         }
     }
 
+    #[inline(always)]
     fn page_end(&self, value: &OrderableScalarValue, inclusive: bool) -> usize {
         if inclusive {
             self.page_records
@@ -650,11 +638,11 @@ impl BTreeLookup {
 
 // Caches btree pages in memory
 #[derive(Debug)]
-struct BTreeCache(Cache<u32, Arc<dyn ScalarIndex>>);
+struct BTreeCache(Cache<u32, RecordBatch>);
 
 impl DeepSizeOf for BTreeCache {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        self.0.iter().map(|(_, v)| v.deep_size_of()).sum()
+        self.0.iter().map(|(_, v)| v.get_array_memory_size()).sum()
     }
 }
 
@@ -722,7 +710,7 @@ impl BTreeIndex {
         let page_cache = Arc::new(BTreeCache(
             Cache::builder()
                 .max_capacity(*CACHE_SIZE)
-                .weigher(|_, v: &Arc<dyn ScalarIndex>| v.deep_size_of() as u32)
+                .weigher(|_, v: &RecordBatch| v.get_array_memory_size() as u32)
                 .build(),
         ));
         Self {
@@ -740,7 +728,7 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<dyn ScalarIndex>> {
+    ) -> Result<RecordBatch> {
         self.page_cache
             .0
             .try_get_with(
@@ -759,7 +747,7 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<dyn ScalarIndex>> {
+    ) -> Result<RecordBatch> {
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
@@ -769,8 +757,7 @@ impl BTreeIndex {
         if let Some(fri_ref) = self.fri.as_ref() {
             serialized_page = fri_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         }
-        let subindex = self.sub_index.load_subindex(serialized_page).await?;
-        Ok(subindex)
+        Ok(serialized_page)
     }
 
     async fn search_page(
@@ -780,7 +767,8 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<RowIdTreeMap> {
-        let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
+        let page = self.lookup_page(page_number, index_reader, metrics).await?;
+        let subindex = self.sub_index.load_subindex(page)?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
@@ -943,21 +931,15 @@ impl Index for BTreeIndex {
 
         let batch_size = self.batch_size as usize;
         let num_pages = num_rows.div_ceil(batch_size);
-        let mut pages = stream::iter(0..num_pages)
-            .map(|page_idx| {
-                let sub_index = self.sub_index.clone();
-                let offset = page_idx * batch_size;
-                let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
-                let page = all_pages.slice(offset, end - offset);
-                async move {
-                    let sub_idx = sub_index.load_subindex(page).await?;
-                    Result::Ok((page_idx as u32, sub_idx))
-                }
-            })
-            .buffer_unordered(get_num_compute_intensive_cpus());
+        let pages = (0..num_pages).map(|page_idx| {
+            let offset = page_idx * batch_size;
+            let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
+            let page = all_pages.slice(offset, end - offset);
+            page
+        });
 
-        while let Some((page_idx, sub_idx)) = pages.try_next().await? {
-            self.page_cache.0.insert(page_idx, sub_idx).await;
+        for (page_idx, page) in pages.enumerate() {
+            self.page_cache.0.insert(page_idx as u32, page).await;
         }
         Ok(())
     }
@@ -993,7 +975,7 @@ impl Index for BTreeIndex {
             .await
             .buffered(self.store.io_parallelism());
         while let Some(serialized) = reader_stream.try_next().await? {
-            let page = self.sub_index.load_subindex(serialized).await?;
+            let page = self.sub_index.load_subindex(serialized)?;
             frag_ids |= page.calculate_included_frags().await?;
         }
 
@@ -1026,17 +1008,10 @@ impl ScalarIndex for BTreeIndex {
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
         let lazy_index_reader = LazyIndexReader::new(self.store.clone());
-        let page_tasks = pages
-            .into_iter()
-            .map(|page_index| {
-                self.search_page(query, page_index, lazy_index_reader.clone(), metrics)
-                    .boxed()
-            })
-            .collect::<Vec<_>>();
-        debug!("Searching {} btree pages", page_tasks.len());
-        let row_ids = stream::iter(page_tasks)
-            // I/O and compute mixed here but important case is index in cache so
-            // use compute intensive thread count
+
+        debug!("Searching {} btree pages", pages.len());
+        let row_ids = stream::iter(pages)
+            .map(|page| self.search_page(query, page, lazy_index_reader.clone(), metrics))
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<RowIdTreeMap>()
             .await?;
@@ -1160,7 +1135,7 @@ pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     async fn train(&self, batch: RecordBatch) -> Result<RecordBatch>;
 
     /// Deserialize a subindex from Arrow
-    async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>>;
+    fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>>;
 
     /// Retrieve the data used to originally train this page
     ///

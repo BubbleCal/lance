@@ -28,7 +28,7 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 
 fn bench_btree_search(c: &mut Criterion) {
-    const TOTAL: usize = 1_000_000;
+    const TOTAL: usize = 10_000_000;
     const BATCH_SIZE: u32 = 4096;
 
     let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();

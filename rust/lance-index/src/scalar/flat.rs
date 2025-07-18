@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::{any::Any, ops::Bound, sync::Arc};
 
+use arrow_array::Array;
 use arrow_array::{
     cast::AsArray, types::UInt64Type, ArrayRef, BooleanArray, RecordBatch, UInt64Array,
 };
@@ -132,7 +133,7 @@ impl BTreeSubIndex for FlatIndexMetadata {
         )?)
     }
 
-    async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>> {
+    fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>> {
         let has_nulls = serialized.column(0).null_count() > 0;
         Ok(Arc::new(FlatIndex {
             data: Arc::new(serialized),
