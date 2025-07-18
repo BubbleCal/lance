@@ -606,7 +606,10 @@ impl BTreeLookup {
             return vec![];
         }
 
-        (lower_bound..upper_bound).map(|page| page as u32).collect()
+        self.page_records[lower_bound..upper_bound]
+            .iter()
+            .map(|page| page.page_number)
+            .collect()
     }
 
     fn pages_null(&self) -> Vec<u32> {
@@ -638,11 +641,11 @@ impl BTreeLookup {
 
 // Caches btree pages in memory
 #[derive(Debug)]
-struct BTreeCache(Cache<u32, RecordBatch>);
+struct BTreeCache(Cache<u32, Arc<dyn ScalarIndex>>);
 
 impl DeepSizeOf for BTreeCache {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        self.0.iter().map(|(_, v)| v.get_array_memory_size()).sum()
+        self.0.iter().map(|(_, v)| v.deep_size_of()).sum()
     }
 }
 
@@ -710,7 +713,7 @@ impl BTreeIndex {
         let page_cache = Arc::new(BTreeCache(
             Cache::builder()
                 .max_capacity(*CACHE_SIZE)
-                .weigher(|_, v: &RecordBatch| v.get_array_memory_size() as u32)
+                .weigher(|_, v: &Arc<dyn ScalarIndex>| v.deep_size_of() as u32)
                 .build(),
         ));
         Self {
@@ -728,13 +731,13 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<RecordBatch> {
+    ) -> Result<Arc<dyn ScalarIndex>> {
         self.page_cache
             .0
-            .try_get_with(
-                page_number,
-                self.load_page(page_number, index_reader, metrics),
-            )
+            .try_get_with(page_number, async move {
+                let page = self.load_page(page_number, index_reader, metrics).await?;
+                Result::Ok(self.sub_index.load_subindex(page)?)
+            })
             .await
             .map_err(|e| Error::Internal {
                 message: format!("Failed to load page {page_number}: {e}"),
@@ -767,13 +770,12 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<RowIdTreeMap> {
-        let page = self.lookup_page(page_number, index_reader, metrics).await?;
-        let subindex = self.sub_index.load_subindex(page)?;
+        let sub_index = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
         // to search for X IN [5, 3]
-        match subindex.search(query, metrics).await? {
+        match sub_index.search(query, metrics).await? {
             SearchResult::Exact(map) => Ok(map),
             _ => Err(Error::Internal {
                 message: "BTree sub-indices need to return exact results".to_string(),
@@ -935,10 +937,11 @@ impl Index for BTreeIndex {
             let offset = page_idx * batch_size;
             let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
             let page = all_pages.slice(offset, end - offset);
-            page
+            self.sub_index.load_subindex(page)
         });
 
         for (page_idx, page) in pages.enumerate() {
+            let page = page?;
             self.page_cache.0.insert(page_idx as u32, page).await;
         }
         Ok(())
