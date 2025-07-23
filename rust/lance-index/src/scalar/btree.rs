@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::ops::BitOr;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -43,6 +44,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
+use lance_table::utils::LanceIteratorExtension;
 use log::debug;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
@@ -541,27 +543,43 @@ impl Ord for OrderableScalarValue {
     }
 }
 
-#[derive(Debug, DeepSizeOf, PartialEq, Eq)]
-struct PageRecord {
-    min: OrderableScalarValue,
-    max: OrderableScalarValue,
-    page_number: u32,
-}
-
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
-    page_records: Vec<PageRecord>,
+    mins: Vec<OrderableScalarValue>,
+    maxs: Vec<OrderableScalarValue>,
+    page_numbers: Vec<u32>,
     /// Pages where the value may be null
     null_pages: Vec<u32>,
 }
 
 impl BTreeLookup {
-    fn new(page_records: Vec<PageRecord>, null_pages: Vec<u32>) -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            page_records,
-            null_pages,
+            mins: Vec::with_capacity(capacity),
+            maxs: Vec::with_capacity(capacity),
+            page_numbers: Vec::with_capacity(capacity),
+            null_pages: Vec::new(),
         }
+    }
+
+    pub fn add_page(
+        &mut self,
+        min: OrderableScalarValue,
+        max: OrderableScalarValue,
+        page_number: u32,
+    ) {
+        self.mins.push(min);
+        self.maxs.push(max);
+        self.page_numbers.push(page_number);
+    }
+
+    pub fn add_null_page(&mut self, page_number: u32) {
+        self.null_pages.push(page_number);
+    }
+
+    pub fn len(&self) -> usize {
+        self.mins.len()
     }
 
     // All pages that could have a value equal to val
@@ -587,55 +605,43 @@ impl BTreeLookup {
     }
 
     // All pages that could have a value in the range
+    #[inline(always)]
     fn pages_between(
         &self,
         range: (Bound<&OrderableScalarValue>, Bound<&OrderableScalarValue>),
     ) -> Vec<u32> {
         let lower_bound = match range.0 {
             Bound::Unbounded => 0,
-            Bound::Included(lower) => self.page_start(lower, true),
-            Bound::Excluded(lower) => self.page_start(lower, false),
+            Bound::Included(lower) => self.maxs.partition_point(|max| max < lower),
+            Bound::Excluded(lower) => self.maxs.partition_point(|max| max <= lower),
         };
+        if lower_bound == self.len() {
+            return vec![];
+        }
+
         let upper_bound = match range.1 {
-            Bound::Unbounded => self.page_records.len(),
-            Bound::Included(upper) => self.page_end(upper, true),
-            Bound::Excluded(upper) => self.page_end(upper, false),
+            Bound::Unbounded => self.len(),
+            Bound::Included(upper) => {
+                if range.0 == range.1
+                    && (lower_bound + 1 == self.len() || &self.mins[lower_bound + 1] > upper)
+                {
+                    lower_bound + 1
+                } else {
+                    self.mins.partition_point(|min| min <= upper)
+                }
+            }
+            Bound::Excluded(upper) => self.mins.partition_point(|min| min < upper),
         };
 
         if lower_bound >= upper_bound {
             return vec![];
         }
 
-        self.page_records[lower_bound..upper_bound]
-            .iter()
-            .map(|page| page.page_number)
-            .collect()
+        self.page_numbers[lower_bound..upper_bound].to_vec()
     }
 
     fn pages_null(&self) -> Vec<u32> {
         self.null_pages.clone()
-    }
-
-    #[inline(always)]
-    fn page_start(&self, value: &OrderableScalarValue, inclusive: bool) -> usize {
-        if inclusive {
-            self.page_records
-                .partition_point(|page| page.max.cmp(value) == Ordering::Less)
-        } else {
-            self.page_records
-                .partition_point(|page| page.max.cmp(value) != Ordering::Greater)
-        }
-    }
-
-    #[inline(always)]
-    fn page_end(&self, value: &OrderableScalarValue, inclusive: bool) -> usize {
-        if inclusive {
-            self.page_records
-                .partition_point(|page| page.min.cmp(value) != Ordering::Greater)
-        } else {
-            self.page_records
-                .partition_point(|page| page.min.cmp(value) == Ordering::Less)
-        }
     }
 }
 
@@ -702,14 +708,13 @@ pub struct BTreeIndex {
 
 impl BTreeIndex {
     fn new(
-        tree: Vec<PageRecord>,
-        null_pages: Vec<u32>,
+        lookup: BTreeLookup,
         store: Arc<dyn IndexStore>,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Self {
-        let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
+        let page_lookup = Arc::new(lookup);
         let page_cache = Arc::new(BTreeCache(
             Cache::builder()
                 .max_capacity(*CACHE_SIZE)
@@ -790,20 +795,13 @@ impl BTreeIndex {
         batch_size: u64,
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let mut page_records = Vec::with_capacity(data.num_rows().div_ceil(batch_size as usize));
-        let mut null_pages = Vec::<u32>::new();
+        let mut page_lookup =
+            BTreeLookup::with_capacity(data.num_rows().div_ceil(batch_size as usize));
 
         if data.num_rows() == 0 {
             let data_type = data.column(0).data_type().clone();
             let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
-            return Ok(Self::new(
-                page_records,
-                null_pages,
-                store,
-                sub_index,
-                batch_size,
-                fri,
-            ));
+            return Ok(Self::new(page_lookup, store, sub_index, batch_size, fri));
         }
 
         let mins = data.column(0);
@@ -835,20 +833,11 @@ impl BTreeIndex {
 
             // If the page is entirely null don't even bother putting it in the tree
             if !max.0.is_null() {
-                if let Some(last) = page_records.last() {
-                    assert!(last.min.cmp(&min) != Ordering::Greater);
-                    assert!(last.max.cmp(&max) != Ordering::Greater);
-                }
-
-                page_records.push(PageRecord {
-                    min,
-                    max,
-                    page_number,
-                });
+                page_lookup.add_page(min, max, page_number);
             }
 
             if null_count > 0 {
-                null_pages.push(page_number);
+                page_lookup.add_null_page(page_number);
             }
         }
 
@@ -857,14 +846,7 @@ impl BTreeIndex {
         // TODO: Support other page types?
         let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
 
-        Ok(Self::new(
-            page_records,
-            null_pages,
-            store,
-            sub_index,
-            batch_size,
-            fri,
-        ))
+        Ok(Self::new(page_lookup, store, sub_index, batch_size, fri))
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
@@ -952,18 +934,10 @@ impl Index for BTreeIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        let min = self
-            .page_lookup
-            .page_records
-            .first()
-            .map(|page| page.min.clone());
-        let max = self
-            .page_lookup
-            .page_records
-            .last()
-            .map(|page| page.max.clone());
+        let min = self.page_lookup.mins.first().cloned();
+        let max = self.page_lookup.maxs.last().cloned();
         serde_json::to_value(&BTreeStatistics {
-            num_pages: self.page_lookup.page_records.len() as u32,
+            num_pages: self.page_lookup.len() as u32,
             min,
             max,
         })
