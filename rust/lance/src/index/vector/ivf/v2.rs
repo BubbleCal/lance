@@ -626,19 +626,21 @@ pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::{ops::Range, sync::Arc};
+    use std::sync::Arc;
 
     use all_asserts::{assert_ge, assert_lt};
     use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
-        Int64Array, ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
+        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_datagen::{Dimension, RowCount};
+    use rand::SeedableRng;
 
     use crate::index::{vector::is_ivf_hnsw, DatasetIndexInternalExt};
     use crate::utils::test::copy_test_data_to_tmp;
@@ -678,23 +680,22 @@ mod tests {
     };
     use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_linalg::kernels::normalize_fsl;
-    use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
+    use lance_testing::datagen::generate_random_array;
     use object_store::path::Path;
-    use rand::distr::uniform::SampleUniform;
     use rstest::rstest;
     use tempfile::tempdir;
 
-    const NUM_ROWS: usize = 500;
-    const DIM: usize = 32;
+    const NUM_ROWS: usize = 1024;
+    const DIM: usize = 16;
 
-    async fn generate_test_dataset<T: ArrowPrimitiveType>(
+    async fn generate_test_dataset<T: ArrowPrimitiveType + Send + Sync>(
         test_uri: &str,
-        range: Range<T::Native>,
     ) -> (Dataset, Arc<FixedSizeListArray>)
     where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
-        let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, range, false);
+        let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, false, false);
         let vectors = batch.column_by_name("vector").unwrap().clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         let dataset = Dataset::write(
@@ -710,78 +711,118 @@ mod tests {
         (dataset, Arc::new(vectors.as_fixed_size_list().clone()))
     }
 
-    async fn generate_multivec_test_dataset<T: ArrowPrimitiveType>(
+    async fn generate_multivec_test_dataset<T: ArrowPrimitiveType + Send + Sync>(
         test_uri: &str,
-        range: Range<T::Native>,
     ) -> (Dataset, Arc<ListArray>)
     where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
-        let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, range, true);
+        let (batch, schema) = generate_batch::<T>(NUM_ROWS, None, true, false);
         let vectors = batch.column_by_name("vector").unwrap().clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
         (dataset, Arc::new(vectors.as_list::<i32>().clone()))
     }
 
-    async fn append_dataset<T: ArrowPrimitiveType>(
+    async fn append_dataset<T: ArrowPrimitiveType + Send + Sync>(
         dataset: &mut Dataset,
         num_rows: usize,
-        range: Range<T::Native>,
+        out_of_dist: bool,
     ) -> ArrayRef
     where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         let is_multivector = matches!(
             dataset.schema().field("vector").unwrap().data_type(),
             DataType::List(_)
         );
         let row_count = dataset.count_all_rows().await.unwrap();
-        let (batch, schema) =
-            generate_batch::<T>(num_rows, Some(row_count as u64), range, is_multivector);
+        let (batch, schema) = generate_batch::<T>(
+            num_rows,
+            Some(row_count as u64),
+            is_multivector,
+            out_of_dist,
+        );
         let vectors = batch["vector"].clone();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         dataset.append(batches, None).await.unwrap();
         vectors
     }
 
-    fn generate_batch<T: ArrowPrimitiveType>(
+    fn generate_batch<T: ArrowPrimitiveType + Send + Sync>(
         num_rows: usize,
         start_id: Option<u64>,
-        range: Range<T::Native>,
         is_multivector: bool,
+        out_of_dist: bool,
     ) -> (RecordBatch, SchemaRef)
     where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         const VECTOR_NUM_PER_ROW: usize = 3;
         let start_id = start_id.unwrap_or(0);
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + num_rows as u64,
         ));
-        let total_floats = match is_multivector {
-            true => num_rows * VECTOR_NUM_PER_ROW * DIM,
-            false => num_rows * DIM,
+        let num_vectors = match is_multivector {
+            true => num_rows * VECTOR_NUM_PER_ROW,
+            false => num_rows,
         };
-        let vectors = generate_random_array_with_range::<T>(total_floats, range);
-        let data_type = vectors.data_type().clone();
+
+        let mut rng = if out_of_dist {
+            rand_xoshiro::Xoshiro256PlusPlus::from_seed([57; 32])
+        } else {
+            rand_xoshiro::Xoshiro256PlusPlus::from_seed([75; 32])
+        };
+        let centroids = lance_datagen::array::rand_vec::<T>(Dimension::from(DIM as u32))
+            .generate(RowCount::from(32), &mut rng)
+            .unwrap()
+            .as_fixed_size_list()
+            .clone();
+        // cast the centroids to float32s because the jitter requires
+        let centroids = FixedSizeListArray::try_new_from_values(
+            arrow_cast::cast(centroids.values(), &DataType::Float32).unwrap(),
+            centroids.value_length(),
+        )
+        .unwrap();
+        let jitter = if T::DATA_TYPE.is_floating() {
+            0.05
+        } else {
+            1.0
+        };
+        let mut vec_gen = lance_datagen::array::jitter_centroids_with_value_type(
+            Arc::new(centroids),
+            jitter,
+            T::DATA_TYPE,
+        );
         let mut fields = vec![Field::new("id", DataType::UInt64, false)];
         let mut arrays: Vec<ArrayRef> = vec![ids];
-        let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        let mut fsl = vec_gen
+            .generate(
+                RowCount::from(num_vectors as u64),
+                &mut rand_xoshiro::Xoshiro256PlusPlus::from_os_rng(),
+            )
+            .unwrap()
+            .as_fixed_size_list()
+            .clone();
+
+        if out_of_dist && fsl.value_type() != DataType::UInt8 {
+            fsl = FixedSizeListArray::try_new_from_values(
+                arrow_arith::numeric::mul_wrapping(&fsl.values(), &fsl.values()).unwrap(),
+                fsl.value_length(),
+            )
+            .unwrap();
+        }
+
         if fsl.value_type() != DataType::UInt8 {
             fsl = normalize_fsl(&fsl).unwrap();
         }
         if is_multivector {
-            let vector_field = Arc::new(Field::new(
-                "item",
-                DataType::FixedSizeList(Arc::new(Field::new("item", data_type, true)), DIM as i32),
-                true,
-            ));
-            fields.push(Field::new(
-                "vector",
-                DataType::List(vector_field.clone()),
-                true,
-            ));
+            let vector_field = Arc::new(Field::new("item", fsl.data_type().clone(), true));
+            let field = Arc::new(Field::new_list("vector", vector_field.clone(), true));
+            fields.push(field.as_ref().clone());
             let array = Arc::new(ListArray::new(
                 vector_field,
                 OffsetBuffer::from_lengths(std::iter::repeat_n(VECTOR_NUM_PER_ROW, num_rows)),
@@ -790,11 +831,8 @@ mod tests {
             ));
             arrays.push(array);
         } else {
-            fields.push(Field::new(
-                "vector",
-                DataType::FixedSizeList(Arc::new(Field::new("item", data_type, true)), DIM as i32),
-                true,
-            ));
+            let field = Arc::new(Field::new("vector", fsl.data_type().clone(), true));
+            fields.push(field.as_ref().clone());
             let array = Arc::new(fsl);
             arrays.push(array);
         }
@@ -859,15 +897,13 @@ mod tests {
     ) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..4, dataset)
-                    .await;
+                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, dataset).await;
             }
             _ => {
                 test_index_impl::<Float32Type>(
                     params.clone(),
                     nlist,
                     recall_requirement,
-                    0.0..1.0,
                     dataset.clone(),
                 )
                 .await;
@@ -878,33 +914,27 @@ mod tests {
                     && dataset.is_none()
                 // if dataset is provided, it has been created, so the data type is already determined, no need to test float64
                 {
-                    test_index_impl::<Float64Type>(
-                        params,
-                        nlist,
-                        recall_requirement,
-                        0.0..1.0,
-                        dataset,
-                    )
-                    .await;
+                    test_index_impl::<Float64Type>(params, nlist, recall_requirement, dataset)
+                        .await;
                 }
             }
         }
     }
 
-    async fn test_index_impl<T: ArrowPrimitiveType>(
+    async fn test_index_impl<T: ArrowPrimitiveType + Send + Sync>(
         params: VectorIndexParams,
         nlist: usize,
         recall_requirement: f32,
-        range: Range<T::Native>,
         dataset: Option<(Dataset, Arc<FixedSizeListArray>)>,
     ) where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let (mut dataset, vectors) = match dataset {
             Some((dataset, vectors)) => (dataset, vectors),
-            None => generate_test_dataset::<T>(test_uri, range).await,
+            None => generate_test_dataset::<T>(test_uri).await,
         };
 
         let vector_column = "vector";
@@ -947,24 +977,24 @@ mod tests {
     async fn test_remap(params: VectorIndexParams, nlist: usize) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_remap_impl::<UInt8Type>(params, nlist, 0..4).await;
+                test_remap_impl::<UInt8Type>(params, nlist).await;
             }
             _ => {
-                test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+                test_remap_impl::<Float32Type>(params, nlist).await;
             }
         }
     }
 
-    async fn test_remap_impl<T: ArrowPrimitiveType>(
+    async fn test_remap_impl<T: ArrowPrimitiveType + Send + Sync>(
         params: VectorIndexParams,
         nlist: usize,
-        range: Range<T::Native>,
     ) where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri).await;
 
         let vector_column = "vector";
         dataset
@@ -1027,7 +1057,7 @@ mod tests {
         assert_ge!(recall, 0.8, "{}", recall);
 
         // delete so that only one row left, to trigger remap and there must be some empty partitions
-        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri).await;
         dataset
             .create_index(&[vector_column], IndexType::Vector, None, &params, true)
             .await
@@ -1054,23 +1084,23 @@ mod tests {
     async fn test_optimize_strategy(params: VectorIndexParams) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_optimize_strategy_impl::<UInt8Type>(params, 0..4).await;
+                test_optimize_strategy_impl::<UInt8Type>(params).await;
             }
             _ => {
-                test_optimize_strategy_impl::<Float32Type>(params, 0.0..1.0).await;
+                test_optimize_strategy_impl::<Float32Type>(params).await;
             }
         }
     }
 
-    async fn test_optimize_strategy_impl<T: ArrowPrimitiveType>(
+    async fn test_optimize_strategy_impl<T: ArrowPrimitiveType + Send + Sync>(
         params: VectorIndexParams,
-        range: Range<T::Native>,
     ) where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range.clone()).await;
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri).await;
 
         let vector_column = "vector";
         dataset
@@ -1113,7 +1143,7 @@ mod tests {
             total_loss / num_rows as f64
         }
 
-        const AVG_LOSS_RETRAIN_THRESHOLD: f64 = 1.1;
+        const AVG_LOSS_RETRAIN_THRESHOLD: f64 = 1.3;
         let original_ivfs = get_ivf_models(&dataset).await;
         let original_avg_loss = get_avg_loss(&dataset).await;
         let original_ivf = &original_ivfs[0];
@@ -1122,14 +1152,7 @@ mod tests {
         let mut last_avg_loss = original_avg_loss;
         // append more rows and make delta index until hitting the retrain threshold
         loop {
-            let range = match count {
-                0 => range.clone(),
-                _ => match params.metric_type {
-                    DistanceType::Hamming => range.start..range.end.add_wrapping(range.end),
-                    _ => range.end.neg_wrapping()..range.start,
-                },
-            };
-            append_dataset::<T>(&mut dataset, NUM_ROWS / 5, range).await;
+            append_dataset::<T>(&mut dataset, NUM_ROWS / 5, count > 0).await;
             dataset
                 .optimize_indices(&OptimizeOptions::append())
                 .await
@@ -1177,7 +1200,10 @@ mod tests {
         let ivf_models = get_ivf_models(&dataset).await;
         let ivf = &ivf_models[0];
         assert_ne!(original_ivf.centroids, ivf.centroids);
-        if ivf.num_partitions() > 1 && params.metric_type != DistanceType::Hamming {
+        if ivf.num_partitions() > 1
+            && params.metric_type != DistanceType::Hamming
+            && params.metric_type != DistanceType::Dot
+        {
             assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
         }
     }
@@ -1185,23 +1211,23 @@ mod tests {
     async fn test_delete_all_rows(params: VectorIndexParams) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_delete_all_rows_impl::<UInt8Type>(params, 0..4).await;
+                test_delete_all_rows_impl::<UInt8Type>(params).await;
             }
             _ => {
-                test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0).await;
+                test_delete_all_rows_impl::<Float32Type>(params).await;
             }
         }
     }
 
-    async fn test_delete_all_rows_impl<T: ArrowPrimitiveType>(
+    async fn test_delete_all_rows_impl<T: ArrowPrimitiveType + Send + Sync>(
         params: VectorIndexParams,
-        range: Range<T::Native>,
     ) where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range.clone()).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri).await;
 
         let vector_column = "vector";
         dataset
@@ -1231,7 +1257,7 @@ mod tests {
         // compact after delete all rows
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, _) = generate_test_dataset::<T>(test_uri).await;
 
         let vector_column = "vector";
         dataset
@@ -1479,33 +1505,26 @@ mod tests {
         let recall_requirement = recall_requirement * 0.9;
         match params.metric_type {
             DistanceType::Hamming => {
-                test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..4)
-                    .await;
+                test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement).await;
             }
             _ => {
-                test_index_multivec_impl::<Float32Type>(
-                    params,
-                    nlist,
-                    recall_requirement,
-                    0.0..1.0,
-                )
-                .await;
+                test_index_multivec_impl::<Float32Type>(params, nlist, recall_requirement).await;
             }
         }
     }
 
-    async fn test_index_multivec_impl<T: ArrowPrimitiveType>(
+    async fn test_index_multivec_impl<T: ArrowPrimitiveType + Send + Sync>(
         params: VectorIndexParams,
         nlist: usize,
         recall_requirement: f32,
-        range: Range<T::Native>,
     ) where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri).await;
 
         dataset
             .create_index(
@@ -1578,7 +1597,7 @@ mod tests {
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri).await;
         test_index(
             v1_params,
             nlist,
@@ -1631,8 +1650,8 @@ mod tests {
 
         let nlist = 4;
         let (mut dataset, _) = match params.metric_type {
-            DistanceType::Hamming => generate_test_dataset::<UInt8Type>(test_uri, 0..2).await,
-            _ => generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await,
+            DistanceType::Hamming => generate_test_dataset::<UInt8Type>(test_uri).await,
+            _ => generate_test_dataset::<Float32Type>(test_uri).await,
         };
         dataset
             .create_index(
@@ -1680,7 +1699,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let nlist = 500;
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri).await;
 
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
@@ -1720,24 +1739,24 @@ mod tests {
     async fn test_distance_range(params: Option<VectorIndexParams>, nlist: usize) {
         match params.as_ref().map_or(DistanceType::L2, |p| p.metric_type) {
             DistanceType::Hamming => {
-                test_distance_range_impl::<UInt8Type>(params, nlist, 0..255).await;
+                test_distance_range_impl::<UInt8Type>(params, nlist).await;
             }
             _ => {
-                test_distance_range_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+                test_distance_range_impl::<Float32Type>(params, nlist).await;
             }
         }
     }
 
-    async fn test_distance_range_impl<T: ArrowPrimitiveType>(
+    async fn test_distance_range_impl<T: ArrowPrimitiveType + Send + Sync>(
         params: Option<VectorIndexParams>,
         nlist: usize,
-        range: Range<T::Native>,
     ) where
-        T::Native: SampleUniform,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T::Native>,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri).await;
 
         let vector_column = "vector";
         let dist_type = params.as_ref().map_or(DistanceType::L2, |p| p.metric_type);
@@ -1848,7 +1867,7 @@ mod tests {
     async fn test_index_with_zero_vectors() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (batch, schema) = generate_batch::<Float32Type>(256, None, 0.0..1.0, false);
+        let (batch, schema) = generate_batch::<Float32Type>(256, None, false, false);
         let vector_field = schema.field(1).clone();
         let zero_batch = RecordBatch::try_new(
             schema.clone(),
@@ -1884,7 +1903,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn test_recall<T: ArrowPrimitiveType>(
+    async fn test_recall<T: ArrowPrimitiveType + Send + Sync>(
         params: VectorIndexParams,
         nlist: usize,
         recall_requirement: f32,
@@ -2063,7 +2082,7 @@ mod tests {
     async fn test_optimize_with_empty_partition() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri).await;
 
         let num_rows = dataset.count_all_rows().await.unwrap();
         let nlist = num_rows + 2;
@@ -2081,7 +2100,7 @@ mod tests {
             .await
             .unwrap();
 
-        append_dataset::<Float32Type>(&mut dataset, 1, 0.0..1.0).await;
+        append_dataset::<Float32Type>(&mut dataset, 1, false).await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await

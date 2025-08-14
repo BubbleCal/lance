@@ -1484,12 +1484,16 @@ struct JitterCentroidsGenerator {
     noise_level: f32,
     data_type: DataType,
     data_field: Arc<Field>,
-
+    value_type: DataType,
     offset: usize,
 }
 
 impl JitterCentroidsGenerator {
-    fn try_new(centroids: Arc<dyn Array>, noise_level: f32) -> Result<Self, ArrowError> {
+    fn try_new(
+        centroids: Arc<dyn Array>,
+        noise_level: f32,
+        value_type: DataType,
+    ) -> Result<Self, ArrowError> {
         let DataType::FixedSizeList(values_field, dimension) = centroids.data_type() else {
             return Err(ArrowError::InvalidArgumentError(
                 "Centroids must be a FixedSizeList".to_string(),
@@ -1500,7 +1504,9 @@ impl JitterCentroidsGenerator {
                 "Centroids values must be a Float32".to_string(),
             ));
         }
-        let data_type = DataType::FixedSizeList(values_field.clone(), *dimension);
+
+        let field = Arc::new(Field::new("item", value_type.clone(), false));
+        let data_type = DataType::FixedSizeList(field.clone(), *dimension);
         Ok(Self {
             centroids: centroids
                 .as_fixed_size_list()
@@ -1510,7 +1516,8 @@ impl JitterCentroidsGenerator {
             dimension: *dimension as u32,
             noise_level,
             data_type,
-            data_field: values_field.clone(),
+            data_field: field,
+            value_type,
             offset: 0,
         })
     }
@@ -1543,10 +1550,11 @@ impl ArrayGenerator for JitterCentroidsGenerator {
             self.offset = (self.offset + self.dimension as usize) % self.centroids.len();
         }
         let values = values_builder.finish();
+        let values = arrow_cast::cast(&values, &self.value_type)?;
         let vectors = FixedSizeListArray::try_new(
             self.data_field.clone(),
             self.dimension as i32,
-            Arc::new(values),
+            values,
             None,
         )?;
         Ok(Arc::new(vectors))
@@ -1926,7 +1934,18 @@ pub mod array {
     ///
     /// Each value will be spaced in slightly away from the previous value on a ball of radius jitter
     pub fn jitter_centroids(centroids: Arc<dyn Array>, jitter: f32) -> Box<dyn ArrayGenerator> {
-        Box::new(JitterCentroidsGenerator::try_new(centroids, jitter).unwrap())
+        Box::new(JitterCentroidsGenerator::try_new(centroids, jitter, DataType::Float32).unwrap())
+    }
+
+    /// Create a generator of vectors by cycling through a given set of vectors
+    ///
+    /// Each value will be spaced in slightly away from the previous value on a ball of radius jitter
+    pub fn jitter_centroids_with_value_type(
+        centroids: Arc<dyn Array>,
+        jitter: f32,
+        value_type: DataType,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(JitterCentroidsGenerator::try_new(centroids, jitter, value_type).unwrap())
     }
 
     /// Create a generator from a vector of values
